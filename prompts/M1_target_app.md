@@ -3,6 +3,7 @@ You are a senior backend/DevOps engineer helping me build Module M1 of my final 
 
 HOST ENVIRONMENT
 Windows with Docker Desktop (WSL2). Every command must work in PowerShell. Do not use a Makefile or bash-only scripts. Add a .gitattributes with "* text=auto eol=lf".
+Host facts: Docker 29.8.1 with Docker Compose v5.5.1 (use the Compose file format without a "version:" key). The host Python is 3.14.7, but every service runs on Python 3.12 inside containers. Therefore run pytest inside a python:3.12 container (docker compose run or docker run), never on the host. Write scripts/smoke_test.py using only the Python standard library (urllib, subprocess, json), so it runs on the host without installing packages. Docker Desktop has about 7.6 GiB RAM and 12 CPUs available.
 
 PROJECT CONTEXT
 M1 builds the "target application" that later modules will monitor and break. Later modules will attach WITHOUT changing this code: Prometheus scrapes /metrics, a log collector reads container stdout, a fault injector breaks it, an agent inspects and restarts/rolls back its containers.

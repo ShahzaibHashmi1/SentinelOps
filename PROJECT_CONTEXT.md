@@ -25,6 +25,8 @@ SentinelOps is an AI-powered platform that monitors a containerised application,
 
 Windows with Docker Desktop (WSL2 backend). Commands must work in PowerShell. Edit this line if it changes.
 
+Host facts: Docker 29.8.1 with Docker Compose v5.5.1 (use the Compose file format without a "version:" key). The host Python is 3.14.7, but every service runs on Python 3.12 inside containers. Therefore run pytest inside a python:3.12 container (docker compose run or docker run), never on the host. Write scripts/smoke_test.py using only the Python standard library (urllib, subprocess, json), so it runs on the host without installing packages. Docker Desktop has about 7.6 GiB RAM and 12 CPUs available.
+
 ## 3. Architecture (target application, module M1)
 
 ```
