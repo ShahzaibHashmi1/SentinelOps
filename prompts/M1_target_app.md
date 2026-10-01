@@ -78,7 +78,7 @@ DEFINITION OF DONE (all must be true)
 9. Unit tests and smoke test pass; a fresh clone runs with the README quick start.
 
 WORKING METHOD: 4 CHECKPOINTS
-After each checkpoint STOP. Print: files created (one line each on what it does), exact PowerShell verification commands, the expected output, and any assumption you made. Wait for me to reply "continue".
+After each checkpoint STOP. Print: (1) files created, one line each on what it does, (2) exact PowerShell verification commands, (3) the expected output, (4) any assumption you made, (5) a ready-to-paste update for PROJECT_CONTEXT.md sections 7 (module status), 8 (decision log), 9 (current focus: which checkpoint is next) and 10 (known issues), (6) a suggested git commit message. Then wait for me to reply "continue".
 CP1: repo skeleton, common/ package, db/init.sql, inventory service, postgres + redis + inventory in docker-compose.
 CP2: payments and orders services.
 CP3: gateway, request-id and log/metric verification, /ready and failure behaviour (Definition of Done items 1 to 7).
