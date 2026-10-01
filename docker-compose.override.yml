@@ -1,0 +1,7 @@
+# Development only (loaded automatically by "docker compose up").
+# Publishes service ports to localhost for direct debugging. Bound to 127.0.0.1 only.
+# In production-like runs use:  docker compose -f docker-compose.yml up -d
+services:
+  inventory:
+    ports:
+      - "127.0.0.1:8003:8003"

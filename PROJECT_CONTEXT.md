@@ -1,7 +1,7 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** [date]
+**Last updated:** 2026-10-01
 **Current module:** M1 (Target application)
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
@@ -97,7 +97,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
-| M1 | Target application | 1 | In progress | Prompt: `prompts/M1_target_app.md` |
+| M1 | Target application | 1 | In progress | CP1 done and verified (common/, db/init.sql, inventory, postgres + redis compose); next CP2. Prompt: `prompts/M1_target_app.md` |
 | M2 | Observability stack | 1 | Not started | |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
@@ -122,23 +122,31 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 
 | ID | Date | Decision | Reason |
 |----|------|----------|--------|
-| D1 | [date] | Python/FastAPI for all services | One language, fast to build, owner knows Python |
-| D2 | [date] | Docker Compose, local-first | Zero cost; Azure only for final deployment |
-| D3 | [date] | psycopg pool with explicit size and timeout | Needed for realistic pool-exhaustion faults later |
-| D4 | [date] | JSON logs and `X-Request-ID` propagation | Lets later modules correlate evidence across services |
-| D5 | [date] | 1 uvicorn worker per service and compose resource limits | Makes CPU/memory faults map clearly to one process |
-| D6 | [date] | Message queue deferred to a later module | Not needed for M1; added with fault F14 |
-| D7 | [date] | Dashboard UI follows `docs/ui-mockup/dashboard.png` | Agreed visual target |
+| D1 | 2026-10-01 | Python/FastAPI for all services | One language, fast to build, owner knows Python |
+| D2 | 2026-10-01 | Docker Compose, local-first | Zero cost; Azure only for final deployment |
+| D3 | 2026-10-01 | psycopg pool with explicit size and timeout | Needed for realistic pool-exhaustion faults later |
+| D4 | 2026-10-01 | JSON logs and `X-Request-ID` propagation | Lets later modules correlate evidence across services |
+| D5 | 2026-10-01 | 1 uvicorn worker per service and compose resource limits | Makes CPU/memory faults map clearly to one process |
+| D6 | 2026-10-01 | Message queue deferred to a later module | Not needed for M1; added with fault F14 |
+| D7 | 2026-10-01 | Dashboard UI follows `docs/ui-mockup/dashboard.png` | Agreed visual target |
+| D8 | 2026-10-01 | Compose healthcheck uses /health (liveness); /ready is for dependency checks | A dependency outage must not mark app containers unhealthy |
+| D9 | 2026-10-01 | Successful /health, /ready, /metrics requests logged at DEBUG; 5xx at ERROR | Keeps INFO logs for real traffic and RCA evidence |
+| D10 | 2026-10-01 | Pool opens with wait=False, check_connection, reconnect_timeout=10 s | Service starts without postgres and recovers on its own quickly |
+| D11 | 2026-10-01 | Inventory cache is invalidated on reserve/release; X-Cache debug header | Reads show current stock; cache behaviour is visible during fault tests |
+| D12 | 2026-10-01 | APP_VERSION comes only from the image (build arg to ENV); image tag sentinelops/<svc>:<version> | Rollback by M8 reports the correct version |
+| D13 | 2026-10-01 | POSTGRES_PASSWORD required from .env, no default in repo; money stored as NUMERIC(10,2), JSON float | No secrets in the repo; simple API for a simulated shop |
 
 ## 9. Current focus
 
 - **Module:** M1 Target application
-- **Checkpoint:** CP1 (not started)
-- **Next task:** run `prompts/M1_target_app.md`, checkpoint by checkpoint
+- **Checkpoint:** CP1 done and verified. Next: CP2 (payments and orders services)
+- **Next task:** reply "continue" in the M1 chat, or start a new chat with the handoff prompt (section 11) and checkpoint CP2
 
 ## 10. Known issues
 
-- (none yet)
+- Postgres-down requests take about DB_POOL_TIMEOUT_SECONDS (2 s), equal to HTTP_TIMEOUT_SECONDS. Check the nested timeouts in CP3 (gateway to orders to inventory).
+- Inventory /ready returns 503 when only Redis is down, although reads still work (degraded).
+- Starlette 1.x TestClient warns that it prefers httpx2. In CP4 use httpx.ASGITransport in tests.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

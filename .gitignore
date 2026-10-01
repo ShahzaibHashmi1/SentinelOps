@@ -1,0 +1,19 @@
+# secrets and local config
+.env
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# load test output (numbers are recorded in docs/BASELINE.md)
+loadtest/results/*
+!loadtest/results/.gitkeep
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
