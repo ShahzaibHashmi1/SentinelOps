@@ -1,0 +1,8 @@
+# Pinned and verified together on Python 3.12 (no postgres or redis client: the gateway has no datastore)
+fastapi==0.142.2
+starlette==1.7.0
+uvicorn==0.54.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+httpx==0.28.1
+prometheus-client==0.26.0

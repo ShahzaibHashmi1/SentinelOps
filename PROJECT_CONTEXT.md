@@ -97,7 +97,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
-| M1 | Target application | 1 | In progress | CP1 and CP2 done and verified (common/, inventory, payments, orders, postgres + redis compose); next CP3. Prompt: `prompts/M1_target_app.md` |
+| M1 | Target application | 1 | In progress | CP1 to CP3 done and verified (common/, inventory, payments, orders, gateway, postgres + redis compose; Definition of Done 1 to 7); next CP4. Prompt: `prompts/M1_target_app.md` |
 | M2 | Observability stack | 1 | Not started | |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
@@ -139,16 +139,19 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D15 | 2026-10-02 | Payment idempotency key = order-<order_id>, Redis fast path plus UNIQUE constraint in postgres | Retries never double-charge, even with Redis down |
 | D16 | 2026-10-02 | Inventory reserve/release return unit price; orders table has payment_id | Order amount without an extra call; GET /orders returns the payment |
 | D17 | 2026-10-02 | Downstream errors: 504 downstream_timeout, 502 downstream_unreachable or downstream_error, body {error, downstream, request_id} | One error contract for orders now and the gateway in CP3 |
+| D18 | 2026-10-02 | Gateway timeout 3 s (GATEWAY_HTTP_TIMEOUT_SECONDS) above the 2 s used between backend services | Backend error answers (with downstream detail) reach the client instead of a generic gateway 504 |
+| D19 | 2026-10-02 | Gateway forwards downstream status and body unchanged; it issues 504 downstream_timeout / 502 downstream_unreachable only when orders or payments are unreachable | Gateway stays pure routing; root-cause detail is preserved |
+| D20 | 2026-10-02 | Gateway published on 127.0.0.1:8000 only; /ready has no checks (no datastore) | Safe default on a laptop; readiness reflects the service's own datastores only |
 
 ## 9. Current focus
 
 - **Module:** M1 Target application
-- **Checkpoint:** CP1 and CP2 done and verified. Next: CP3 (gateway, request-id and log/metric verification, /ready and failure behaviour, Definition of Done items 1 to 7)
-- **Next task:** reply "continue" in the M1 chat, or start a new chat with the handoff prompt (section 11) and checkpoint CP3
+- **Checkpoint:** CP1 to CP3 done and verified (Definition of Done 1 to 7). Next: CP4 (Locust, smoke test, unit tests, README, topology.yaml, BASELINE.md, PROJECT_CONTEXT update)
+- **Next task:** reply "continue" in the M1 chat, or start a new chat with the handoff prompt (section 11) and checkpoint CP4
 
 ## 10. Known issues
 
-- Timeouts are equal (HTTP_TIMEOUT_SECONDS = DB_POOL_TIMEOUT_SECONDS = 2 s). With postgres down, orders waits for inventory, which answers 503 after about 2 s, so orders returns 502 or 504 depending on which expires first. CP3: give the gateway a larger timeout than orders so error bodies survive.
+- With postgres down, POST /api/orders returns 504 or 502 with downstream "inventory", depending on whether orders' 2 s timeout or inventory's 2 s pool timeout fires first. Both are 5xx within the gateway timeout. Make deterministic only if the evaluation (M12) needs it.
 - Inventory and payments /ready return 503 when only Redis is down, although they still serve (degraded).
 - Observed on Docker Desktop during CP2 verification: with payments or postgres stopped, orders answers 504 downstream_timeout after about 2 s (the Docker network gives no fast connection refusal), not a fast 502. This is within Definition of Done item 6 (502/504 within the timeout) and is the typical fault signature that M3 to M6 will see.
 - If the charge succeeds but marking the order PAID then fails (postgres down at that moment), the order stays PENDING while the payment exists. Not handled in M1; reconciliation could be a later module.

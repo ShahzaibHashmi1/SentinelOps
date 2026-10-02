@@ -169,6 +169,46 @@ services:
       sentinelops.tier: app
     networks: [sentinelops]
 
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+    image: sentinelops/gateway:${APP_VERSION:-1.0.0}
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      SERVICE_NAME: gateway
+      # Longer than the 2 s used between backend services, so a backend's own error answer
+      # (e.g. orders reporting "inventory timed out") reaches the client instead of a generic 504.
+      HTTP_TIMEOUT_SECONDS: ${GATEWAY_HTTP_TIMEOUT_SECONDS:-3.0}
+      ORDERS_URL: http://orders:8001
+      PAYMENTS_URL: http://payments:8002
+    # The ONLY port published in the base file. Bound to localhost; remove "127.0.0.1:" to expose it on the LAN.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      orders:
+        condition: service_healthy
+      payments:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    labels:
+      sentinelops.service: gateway
+      sentinelops.tier: app
+    networks: [sentinelops]
+
 volumes:
   pgdata:
 
