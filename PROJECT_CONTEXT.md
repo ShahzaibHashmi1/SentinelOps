@@ -1,7 +1,7 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** 2026-10-01
+**Last updated:** 2026-10-02
 **Current module:** M1 (Target application)
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
@@ -97,7 +97,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
-| M1 | Target application | 1 | In progress | CP1 done and verified (common/, db/init.sql, inventory, postgres + redis compose); next CP2. Prompt: `prompts/M1_target_app.md` |
+| M1 | Target application | 1 | In progress | CP1 and CP2 done and verified (common/, inventory, payments, orders, postgres + redis compose); next CP3. Prompt: `prompts/M1_target_app.md` |
 | M2 | Observability stack | 1 | Not started | |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
@@ -135,17 +135,24 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D11 | 2026-10-01 | Inventory cache is invalidated on reserve/release; X-Cache debug header | Reads show current stock; cache behaviour is visible during fault tests |
 | D12 | 2026-10-01 | APP_VERSION comes only from the image (build arg to ENV); image tag sentinelops/<svc>:<version> | Rollback by M8 reports the correct version |
 | D13 | 2026-10-01 | POSTGRES_PASSWORD required from .env, no default in repo; money stored as NUMERIC(10,2), JSON float | No secrets in the repo; simple API for a simulated shop |
+| D14 | 2026-10-02 | Orders workflow compensates on failure: release stock, mark FAILED, answer 502/504 with order_id | Keeps stock and orders consistent when payments or postgres fail mid-flow |
+| D15 | 2026-10-02 | Payment idempotency key = order-<order_id>, Redis fast path plus UNIQUE constraint in postgres | Retries never double-charge, even with Redis down |
+| D16 | 2026-10-02 | Inventory reserve/release return unit price; orders table has payment_id | Order amount without an extra call; GET /orders returns the payment |
+| D17 | 2026-10-02 | Downstream errors: 504 downstream_timeout, 502 downstream_unreachable or downstream_error, body {error, downstream, request_id} | One error contract for orders now and the gateway in CP3 |
 
 ## 9. Current focus
 
 - **Module:** M1 Target application
-- **Checkpoint:** CP1 done and verified. Next: CP2 (payments and orders services)
-- **Next task:** reply "continue" in the M1 chat, or start a new chat with the handoff prompt (section 11) and checkpoint CP2
+- **Checkpoint:** CP1 and CP2 done and verified. Next: CP3 (gateway, request-id and log/metric verification, /ready and failure behaviour, Definition of Done items 1 to 7)
+- **Next task:** reply "continue" in the M1 chat, or start a new chat with the handoff prompt (section 11) and checkpoint CP3
 
 ## 10. Known issues
 
-- Postgres-down requests take about DB_POOL_TIMEOUT_SECONDS (2 s), equal to HTTP_TIMEOUT_SECONDS. Check the nested timeouts in CP3 (gateway to orders to inventory).
-- Inventory /ready returns 503 when only Redis is down, although reads still work (degraded).
+- Timeouts are equal (HTTP_TIMEOUT_SECONDS = DB_POOL_TIMEOUT_SECONDS = 2 s). With postgres down, orders waits for inventory, which answers 503 after about 2 s, so orders returns 502 or 504 depending on which expires first. CP3: give the gateway a larger timeout than orders so error bodies survive.
+- Inventory and payments /ready return 503 when only Redis is down, although they still serve (degraded).
+- Observed on Docker Desktop during CP2 verification: with payments or postgres stopped, orders answers 504 downstream_timeout after about 2 s (the Docker network gives no fast connection refusal), not a fast 502. This is within Definition of Done item 6 (502/504 within the timeout) and is the typical fault signature that M3 to M6 will see.
+- If the charge succeeds but marking the order PAID then fails (postgres down at that moment), the order stays PENDING while the payment exists. Not handled in M1; reconciliation could be a later module.
+- 200 orders at 20 parallel with no wait time gave p95 about 630 ms in the assistant's sandbox. Locust uses wait times, so the CP4 baseline is the real measurement, but Definition of Done item 8 (p95 below 500 ms) is a risk to watch.
 - Starlette 1.x TestClient warns that it prefers httpx2. In CP4 use httpx.ASGITransport in tests.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)

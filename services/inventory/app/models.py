@@ -16,3 +16,4 @@ class StockChange(BaseModel):
     sku: str
     quantity: int  # how many units were reserved / released
     stock: int  # stock level after the change
+    price: float  # unit price, so the orders service can compute the order amount

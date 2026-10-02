@@ -2,6 +2,7 @@
 import httpx
 
 from common.context import request_id_var
+from common.errors import AppError, describe_exception
 from common.metrics import track_dependency
 from common.settings import Settings
 
@@ -37,3 +38,30 @@ async def call_dependency(
         if response.status_code >= 500:
             tracker.outcome = "error"
     return response
+
+
+def downstream_error(dependency: str, exc: Exception) -> AppError:
+    """504 when the downstream timed out, 502 when it could not be reached or the connection broke.
+    Body: {"error", "downstream", "request_id"}."""
+    if isinstance(exc, httpx.TimeoutException):
+        return AppError(504, "downstream_timeout", detail=describe_exception(exc), downstream=dependency)
+    return AppError(502, "downstream_unreachable", detail=describe_exception(exc), downstream=dependency)
+
+
+def downstream_bad_response(dependency: str, response: httpx.Response) -> AppError:
+    """502 for an unexpected answer (5xx, or a 4xx that the caller does not handle)."""
+    return AppError(
+        502, "downstream_error", detail=f"HTTP {response.status_code}",
+        downstream=dependency, downstream_status=response.status_code,
+    )
+
+
+async def request_downstream(
+    client: httpx.AsyncClient, dependency: str, method: str, url: str, **kwargs
+) -> httpx.Response:
+    """call_dependency + httpx errors turned into AppError(504/502). Any HTTP response is returned
+    to the caller, which decides what each status code means."""
+    try:
+        return await call_dependency(client, dependency, method, url, **kwargs)
+    except httpx.HTTPError as exc:
+        raise downstream_error(dependency, exc) from exc

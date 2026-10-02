@@ -16,6 +16,7 @@ CREATE TABLE orders (
     customer_id TEXT          NOT NULL,
     amount      NUMERIC(10,2) NOT NULL,
     status      TEXT          NOT NULL CHECK (status IN ('PENDING', 'PAID', 'FAILED')),
+    payment_id  UUID,                           -- set when the payment succeeded; no foreign key (see payments)
     created_at  TIMESTAMPTZ   NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ   NOT NULL DEFAULT now()
 );

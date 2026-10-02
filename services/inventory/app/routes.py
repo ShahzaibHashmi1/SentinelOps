@@ -46,7 +46,7 @@ async def reserve(sku: str, body: QuantityRequest, request: Request):
         raise AppError(409, "insufficient_stock", sku=sku, requested=body.quantity)
     await cache_invalidate(redis, sku)
     log_event(logger, logging.INFO, "stock_reserved", sku=sku, quantity=body.quantity, stock=row["stock"])
-    return {"sku": sku, "quantity": body.quantity, "stock": row["stock"]}
+    return {"sku": sku, "quantity": body.quantity, "stock": row["stock"], "price": row["price"]}
 
 
 @router.post("/items/{sku}/release", response_model=StockChange)
@@ -57,4 +57,4 @@ async def release(sku: str, body: QuantityRequest, request: Request):
         raise AppError(404, "item_not_found", sku=sku)
     await cache_invalidate(redis, sku)
     log_event(logger, logging.INFO, "stock_released", sku=sku, quantity=body.quantity, stock=row["stock"])
-    return {"sku": sku, "quantity": body.quantity, "stock": row["stock"]}
+    return {"sku": sku, "quantity": body.quantity, "stock": row["stock"], "price": row["price"]}

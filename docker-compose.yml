@@ -96,6 +96,79 @@ services:
       sentinelops.tier: app
     networks: [sentinelops]
 
+  payments:
+    build:
+      context: .
+      dockerfile: services/payments/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+    image: sentinelops/payments:${APP_VERSION:-1.0.0}
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      SERVICE_NAME: payments
+      DATABASE_URL: postgresql://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:?Copy .env.example to .env first}@postgres:5432/${POSTGRES_DB:-shop}
+      REDIS_URL: redis://redis:6379/0
+      PAYMENT_DELAY_MS_MIN: ${PAYMENT_DELAY_MS_MIN:-20}
+      PAYMENT_DELAY_MS_MAX: ${PAYMENT_DELAY_MS_MAX:-80}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    labels:
+      sentinelops.service: payments
+      sentinelops.tier: app
+    networks: [sentinelops]
+
+  orders:
+    build:
+      context: .
+      dockerfile: services/orders/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+    image: sentinelops/orders:${APP_VERSION:-1.0.0}
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      SERVICE_NAME: orders
+      DATABASE_URL: postgresql://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD:?Copy .env.example to .env first}@postgres:5432/${POSTGRES_DB:-shop}
+      INVENTORY_URL: http://inventory:8003
+      PAYMENTS_URL: http://payments:8002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      payments:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    labels:
+      sentinelops.service: orders
+      sentinelops.tier: app
+    networks: [sentinelops]
+
 volumes:
   pgdata:
 
