@@ -2,7 +2,7 @@
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
 **Last updated:** 2026-10-03
-**Current module:** M2 (Observability stack), not started. M1 (Target application) is done and verified
+**Current module:** M2 (Observability stack), in progress: CP1 done and verified. M1 (Target application) is done and verified
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -111,7 +111,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
 | M1 | Target application | 1 | Done (verified) | CP1 to CP4 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop; normal-load baseline in `docs/BASELINE.md`. Prompt: `prompts/M1_target_app.md` |
-| M2 | Observability stack | 1 | Not started | |
+| M2 | Observability stack | 1 | In progress | CP1 done and verified: Prometheus (v3.15.0) scrapes the 4 app services and itself. CP2 (cAdvisor) next. Prompt: `prompts/M2_observability.md` |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
 | M5 | Evidence builder and dependency graph | 2 | Not started | |
@@ -159,12 +159,15 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D22 | 2026-10-02 | Smoke test reads backend /ready and /metrics with `docker compose exec` and uses only the standard library | Backends have no published port in the base compose file; works on the Windows host |
 | D23 | 2026-10-02 | Load test runs from its own image (Locust 2.46.6 pinned) in compose profile "load"; exit code 1 on any failure or p95 above P95_LIMIT_MS (500) | DoD item 8 is checked automatically; think time 0.5 to 1.5 s per user |
 | D24 | 2026-10-02 | docs/topology.yaml is the source of truth for service dependencies | Later modules (dependency graph, evidence builder) read it instead of hard-coding the graph |
+| D25 | 2026-10-03 | Prometheus image pinned to prom/prometheus:v3.15.0, retention 7d via command flag, port 127.0.0.1:9090, healthcheck on /-/ready | Reproducible build; infra tools wait for readiness, not just liveness (deliberate difference from D8) |
+| D26 | 2026-10-03 | Prometheus config directory is bind-mounted (not a single file); reload with SIGHUP; no --web.enable-lifecycle; no depends_on on app services | File mounts can go stale on Windows; no mutating HTTP endpoint; Prometheus keeps running and shows up=0 while an app is stopped |
+| D27 | 2026-10-03 | Scrape job name = service name; no target label called "service"; metrics without a "service" label are selected by job | Avoids exported_service; dependency_*, db_pool_* and http_requests_in_flight carry no service label |
 
 ## 9. Current focus
 
-- **Module:** M2 Observability stack (not started)
-- **Last completed:** M1 Target application, all 4 checkpoints, Definition of Done 1 to 9 verified
-- **Next task:** write the M2 prompt in the same format as `prompts/M1_target_app.md` (Prometheus scrapes /metrics, Loki + Grafana Alloy collect container logs, cAdvisor container metrics, Grafana dashboards), save it as `prompts/M2_observability.md`, then run it checkpoint by checkpoint. M2 must not require changes to the M1 service code.
+- **Module:** M2 Observability stack (in progress)
+- **Last completed:** M2 CP1 (Prometheus + compose profile skeleton), verified
+- **Next task:** M2 CP2: cAdvisor, container series with the "service" label for all 6 containers (DoD 3). Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
 
 ## 10. Known issues
 
@@ -173,6 +176,8 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - Inventory and payments /ready return 503 when only Redis is down, although they still serve (degraded).
 - If the charge succeeds but marking the order PAID then fails (postgres down at that moment), the order stays PENDING while the payment exists. Not handled in M1; reconciliation could be a later module.
 - Locust CSV files in `loadtest/results/` are overwritten by each run and are git-ignored. Copy them before the next run; the M1 baseline numbers are recorded in `docs/BASELINE.md`.
+- http_requests_in_flight, dependency_* and db_pool_* have no "service" label; select them by job (job = service name).
+- Error-rate queries need "or vector(0)": with no 5xx series, sum(rate(...status=~"5..")) returns no data instead of 0.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

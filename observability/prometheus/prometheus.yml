@@ -1,0 +1,44 @@
+# Prometheus configuration for SentinelOps (module M2).
+# Targets are reached over the Docker network by service name, so the backend services
+# need no published ports. cAdvisor is added in CP2.
+#
+# IMPORTANT (the "service" label gotcha):
+# The M1 metrics already carry a metric label named "service" (http_requests_total{service=...}).
+# NEVER add a target label called "service" here (static_configs labels, relabel_configs).
+# If target and metric both have it, Prometheus renames the metric's own label to "exported_service".
+# The job name is used instead: job="orders" etc. This also identifies metrics that have no
+# "service" label (http_requests_in_flight, dependency_*, db_pool_*).
+#
+# Retention (7 days) is a command-line flag, set in docker-compose.yml.
+# No rule_files and no alerting section on purpose: alerting is out of scope (detection is module M4).
+
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s   # must not be larger than scrape_interval
+
+scrape_configs:
+  # One job per M1 service. The job name equals the service name (docs/topology.yaml).
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]
+
+  - job_name: orders
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["orders:8001"]
+
+  - job_name: payments
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["payments:8002"]
+
+  - job_name: inventory
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["inventory:8003"]
+
+  # Prometheus monitors itself (its own scrape health, TSDB size, ...).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -174,3 +174,13 @@ docker-compose.yml, docker-compose.override.yml, .env.example, PROJECT_CONTEXT.m
 | Schema or seed data looks old | `docker compose down -v`, then `docker compose up -d --build --wait` |
 | A container is not healthy | `docker compose logs --tail 30 <service>` |
 | Port 8000 already in use | Stop the other program, or change the left side of `127.0.0.1:8000:8000` in `docker-compose.yml` |
+
+## Observability (module M2, in progress)
+
+Optional metrics stack, started with the compose profile `observability`. A plain `docker compose up -d --wait` still starts only the 6 M1 containers.
+
+    docker compose --profile observability up -d --build --wait
+
+- Prometheus: http://localhost:9090 (targets: http://localhost:9090/targets)
+- More services (cAdvisor, Loki, Alloy, Grafana) and full documentation (docs/OBSERVABILITY.md) arrive in the next M2 checkpoints.
+- `docker compose down -v` also deletes the metrics data volume.

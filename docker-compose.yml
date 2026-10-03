@@ -266,8 +266,49 @@ services:
       sentinelops.tier: infra
     networks: [sentinelops]
 
+  # ---- observability stack (module M2), only started with --profile observability ----
+  # Start: docker compose --profile observability up -d --build --wait
+  # A plain "docker compose up" never starts these services.
+
+  # Metrics database. Scrapes the app services over the Docker network (config: observability/prometheus/).
+  # Deliberately no depends_on on the app services: Prometheus must keep running (and show up = 0)
+  # while an app service is stopped.
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.15.0   # pinned exact tag, never "latest"
+    restart: unless-stopped
+    # Overriding "command" replaces the image defaults, so config.file and tsdb.path are repeated here.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    ports:
+      - "127.0.0.1:9090:9090"   # localhost only
+    volumes:
+      # Mount the DIRECTORY, not the single file: on Windows a file bind mount can keep showing the old
+      # content after an editor replaces the file. Reload after edits: docker compose kill -s SIGHUP prometheus
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus   # "docker compose down -v" deletes this volume
+    # Readiness (/-/ready), not only liveness: later services start only when queries can be answered.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    labels:
+      sentinelops.service: prometheus
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
 volumes:
   pgdata:
+  prometheus-data:
 
 networks:
   sentinelops:
