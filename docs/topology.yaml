@@ -1,0 +1,17 @@
+# Service call graph of the target application (module M1).
+# Format: service -> list of the dependencies it calls. This file is the source of truth
+# (PROJECT_CONTEXT.md section 3); later modules (dependency graph, evidence builder) read it.
+# postgres and redis only appear as dependencies, never as callers.
+gateway:
+  - orders
+  - payments
+orders:
+  - inventory
+  - payments
+  - postgres
+inventory:
+  - postgres
+  - redis
+payments:
+  - postgres
+  - redis

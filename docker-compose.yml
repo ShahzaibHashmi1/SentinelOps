@@ -209,6 +209,63 @@ services:
       sentinelops.tier: app
     networks: [sentinelops]
 
+  # ---- optional tools, only started with --profile (never by a plain "docker compose up") ----
+
+  # Load test: docker compose --profile load run --rm loadtest
+  # USERS, SPAWN_RATE and DURATION come from .env (defaults 20, 2, 5m). CSV goes to loadtest/results/.
+  loadtest:
+    profiles: ["load"]
+    build:
+      context: .
+      dockerfile: loadtest/Dockerfile
+    image: sentinelops/loadtest:locust-2.46.6
+    command:
+      - "-f"
+      - "/loadtest/locustfile.py"
+      - "--headless"
+      - "--host"
+      - "http://gateway:8000"
+      - "--users"
+      - "${USERS:-20}"
+      - "--spawn-rate"
+      - "${SPAWN_RATE:-2}"
+      - "--run-time"
+      - "${DURATION:-5m}"
+      - "--csv"
+      - "/results/run"
+      - "--html"
+      - "/results/run_report.html"
+    volumes:
+      - ./loadtest/results:/results
+    depends_on:
+      gateway:
+        condition: service_healthy
+    labels:
+      sentinelops.service: loadtest
+      sentinelops.tier: infra
+    networks: [sentinelops]
+
+  # Unit tests inside python:3.12 (the host Python is 3.14):
+  #   docker compose --profile test run --rm -e SERVICE=orders tests
+  tests:
+    profiles: ["test"]
+    image: python:3.12-slim
+    working_dir: /repo
+    volumes:
+      - .:/repo
+    environment:
+      SERVICE: inventory   # overridden with -e SERVICE=<gateway|orders|payments|inventory>
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    command:
+      - "sh"
+      - "-c"
+      - "pip install -q --no-cache-dir -r services/$${SERVICE}/requirements.txt pytest==9.1.1 httpx==0.28.1 && PYTHONPATH=/repo:/repo/services/$${SERVICE} python -m pytest services/$${SERVICE}/tests -q -p no:cacheprovider"
+    labels:
+      sentinelops.service: tests
+      sentinelops.tier: infra
+    networks: [sentinelops]
+
 volumes:
   pgdata:
 

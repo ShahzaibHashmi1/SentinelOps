@@ -14,8 +14,12 @@ async def _forward_request_id(request: httpx.Request) -> None:
         request.headers["X-Request-ID"] = request_id
 
 
-def create_http_client(settings: Settings) -> httpx.AsyncClient:
+def create_http_client(
+    settings: Settings, transport: httpx.AsyncBaseTransport | None = None
+) -> httpx.AsyncClient:
+    """`transport` is only used by unit tests (httpx.MockTransport); production code leaves it None."""
     return httpx.AsyncClient(
+        transport=transport,
         timeout=httpx.Timeout(settings.http_timeout_seconds),
         limits=httpx.Limits(
             max_connections=settings.http_max_connections,
