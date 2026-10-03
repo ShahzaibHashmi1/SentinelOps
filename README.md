@@ -184,3 +184,13 @@ Optional metrics stack, started with the compose profile `observability`. A plai
 - Prometheus: http://localhost:9090 (targets: http://localhost:9090/targets)
 - More services (cAdvisor, Loki, Alloy, Grafana) and full documentation (docs/OBSERVABILITY.md) arrive in the next M2 checkpoints.
 - `docker compose down -v` also deletes the metrics data volume.
+
+## Observability (module M2, in progress)
+
+Optional metrics stack, started with the compose profile `observability`. A plain `docker compose up -d --wait` still starts only the 6 M1 containers.
+
+    docker compose --profile observability up -d --build --wait
+
+- Prometheus: http://localhost:9090 (targets: http://localhost:9090/targets)
+- More services (cAdvisor, Loki, Alloy, Grafana) and full documentation (docs/OBSERVABILITY.md) arrive in the next M2 checkpoints.
+- `docker compose down -v` also deletes the metrics data volume.
