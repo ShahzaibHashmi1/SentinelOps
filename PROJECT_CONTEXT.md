@@ -1,8 +1,8 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** 2026-10-03
-**Current module:** M2 (Observability stack), in progress: CP1 done and verified. M1 (Target application) is done and verified
+**Last updated:** 2026-10-04
+**Current module:** M2 (Observability stack), in progress: CP1 and CP2 done and verified. M1 (Target application) is done and verified
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -111,7 +111,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
 | M1 | Target application | 1 | Done (verified) | CP1 to CP4 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop; normal-load baseline in `docs/BASELINE.md`. Prompt: `prompts/M1_target_app.md` |
-| M2 | Observability stack | 1 | In progress | CP1 done and verified: Prometheus (v3.15.0) scrapes the 4 app services and itself. CP2 (cAdvisor) next. Prompt: `prompts/M2_observability.md` |
+| M2 | Observability stack | 1 | In progress | CP1 and CP2 done and verified: Prometheus (v3.15.0) scrapes the 4 app services, itself and cAdvisor (v0.60.6, containerd socket mounted for Docker Desktop) with a `service` label on container series. CP3 (Loki + Alloy) next. Prompt: `prompts/M2_observability.md` |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
 | M5 | Evidence builder and dependency graph | 2 | Not started | |
@@ -162,12 +162,15 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D25 | 2026-10-03 | Prometheus image pinned to prom/prometheus:v3.15.0, retention 7d via command flag, port 127.0.0.1:9090, healthcheck on /-/ready | Reproducible build; infra tools wait for readiness, not just liveness (deliberate difference from D8) |
 | D26 | 2026-10-03 | Prometheus config directory is bind-mounted (not a single file); reload with SIGHUP; no --web.enable-lifecycle; no depends_on on app services | File mounts can go stale on Windows; no mutating HTTP endpoint; Prometheus keeps running and shows up=0 while an app is stopped |
 | D27 | 2026-10-03 | Scrape job name = service name; no target label called "service"; metrics without a "service" label are selected by job | Avoids exported_service; dependency_*, db_pool_* and http_requests_in_flight carry no service label |
+| D28 | 2026-10-04 | cAdvisor pinned to ghcr.io/google/cadvisor:v0.60.6, privileged, no published port in the base file; flags: docker_only, housekeeping 5s, no dynamic housekeeping, whitelisted labels, enable_metrics=cpu,memory,network. On Docker Desktop (WSL2) with the containerd image store the VM's /run/containerd/containerd.sock is mounted read-only into the container | Reproducible; fresh data every 5s scrape; only the metric groups we use. Without the containerd socket cAdvisor registers no docker factory (verified on the owner's machine). The mount gives cAdvisor privileged containerd access, like docker.sock; the path may not exist on other hosts |
+| D29 | 2026-10-04 | cadvisor scrape job: honor_timestamps false; metric_relabel keeps only series whose container_label_sentinelops_service is one of the 6 M1 services and copies it to the metric label "service" | Series of stopped containers disappear at the next scrape; consistent "service" label across app and container metrics; limits cardinality |
+| D30 | 2026-10-04 | cAdvisor debug port 127.0.0.1:8081 is published only in docker-compose.override.yml | Production-like runs (-f docker-compose.yml) expose nothing extra |
 
 ## 9. Current focus
 
 - **Module:** M2 Observability stack (in progress)
-- **Last completed:** M2 CP1 (Prometheus + compose profile skeleton), verified
-- **Next task:** M2 CP2: cAdvisor, container series with the "service" label for all 6 containers (DoD 3). Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
+- **Last completed:** M2 CP2 (cAdvisor + service-labelled container series, containerd socket mount), verified on the owner's Docker Desktop
+- **Next task:** M2 CP3: Loki + Alloy log pipeline. Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
 
 ## 10. Known issues
 
@@ -178,6 +181,13 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - Locust CSV files in `loadtest/results/` are overwritten by each run and are git-ignored. Copy them before the next run; the M1 baseline numbers are recorded in `docs/BASELINE.md`.
 - http_requests_in_flight, dependency_* and db_pool_* have no "service" label; select them by job (job = service name).
 - Error-rate queries need "or vector(0)": with no 5xx series, sum(rate(...status=~"5..")) returns no data instead of 0.
+- cAdvisor container series are selected by the "service" label (set in Prometheus metric_relabel_configs). Use max by (service) for spec/gauge metrics and sum by (service) for rates.
+- cAdvisor exports no restart count. container_scrape_error, machine_* and cadvisor_version_info are dropped by the keep rule; debug via http://127.0.0.1:8081/metrics.
+- rate() is underestimated during the first minute of data; wait at least 90 s after a start before judging rates.
+- Verified on the owner's machine: container_start_time_seconds{service=...} changes when a container is restarted (payments: 1791142090 before, 1791142121 after `docker compose restart`), so it is the restart signal for M4/M5; cAdvisor has no restart-count metric.
+- Idle CPU of the app services is not zero: cAdvisor shows about 11 to 13 % of the CPU limit (1-minute average) per app service on an otherwise idle stack, while single `docker stats` samples jump between about 0.1 % and 36 % of a core. Likely cause: the 5-second healthchecks (a Python process each time) and the 5-second Prometheus scrape. Use averaging windows of at least 30 s for CPU thresholds in M4.
+- cAdvisor on Docker Desktop (WSL2) with the containerd image store registers no docker factory unless the VM's /run/containerd/containerd.sock is mounted into the cadvisor container (log symptom: "unable to create containerd client ... no such file or directory"). On hosts without that path Docker creates an empty directory there; adjust or remove the mount.
+- The docker.sock and containerd.sock mounts give cAdvisor privileged access to the container runtime; ":ro" does not restrict API access.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

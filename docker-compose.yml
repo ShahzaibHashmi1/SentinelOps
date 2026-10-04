@@ -306,6 +306,53 @@ services:
       sentinelops.tier: observability
     networks: [sentinelops]
 
+  # Container metrics exporter (CPU, memory, network, limits per container). Scraped by Prometheus.
+  # Needs read access to the host (VM) cgroups and /proc, hence privileged + the mounts below.
+  # No published port in this file; the override file publishes 127.0.0.1:8081 for debugging only.
+  cadvisor:
+    profiles: ["observability"]
+    image: ghcr.io/google/cadvisor:v0.60.6   # pinned exact tag; images from v0.53.0 on live on ghcr.io
+    restart: unless-stopped
+    privileged: true   # documented requirement for reading other containers' cgroups and /proc entries
+    command:
+      - "--docker_only=true"                 # only Docker containers (plus root cgroup, dropped by Prometheus)
+      - "--housekeeping_interval=5s"         # matches the 5s scrape interval
+      - "--allow_dynamic_housekeeping=false" # never slow down to 60s for idle containers (would give stale values)
+      - "--store_container_labels=false"     # no automatic label explosion ...
+      - "--whitelisted_container_labels=com.docker.compose.service,sentinelops.service,sentinelops.tier"   # ... only these
+      - "--enable_metrics=cpu,memory,network" # only the metric groups we use (disk, diskIO, percpu, oom_event, ... off)
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      # Docker API access for container names and labels. ":ro" on a socket does not limit API access;
+      # cAdvisor only reads. The exposure is why this service is localhost-only and profile-gated.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Required on Docker Desktop (WSL2) with the containerd image store (docker info: Storage Driver
+      # "overlayfs", driver-type io.containerd.snapshotter.v1). Without this socket cAdvisor logs
+      # "unable to create containerd client ... containerd.sock: no such file or directory" and registers
+      # no docker container factory, so no per-container series appear. The source path is the one inside
+      # the Docker Desktop VM (verified there), NOT a Windows path. On other hosts it may not exist: Docker
+      # then creates an empty directory at that path and cAdvisor still cannot connect. Adjust or remove it
+      # there. Like docker.sock it gives cAdvisor privileged access to containerd (":ro" does not restrict
+      # API access); acceptable only because the service is localhost-only and profile-gated.
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    labels:
+      sentinelops.service: cadvisor
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
 volumes:
   pgdata:
   prometheus-data:

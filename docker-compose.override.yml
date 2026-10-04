@@ -11,3 +11,6 @@ services:
   inventory:
     ports:
       - "127.0.0.1:8003:8003"
+  cadvisor:   # only exists with --profile observability; debug access to the raw cAdvisor metrics
+    ports:
+      - "127.0.0.1:8081:8080"

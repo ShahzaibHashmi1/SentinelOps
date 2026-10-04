@@ -1,6 +1,6 @@
 # Prometheus configuration for SentinelOps (module M2).
 # Targets are reached over the Docker network by service name, so the backend services
-# need no published ports. cAdvisor is added in CP2.
+# need no published ports. Logs (Loki/Alloy) and Grafana are added in later checkpoints.
 #
 # IMPORTANT (the "service" label gotcha):
 # The M1 metrics already carry a metric label named "service" (http_requests_total{service=...}).
@@ -37,6 +37,31 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["inventory:8003"]
+
+  # Container resource metrics (CPU, memory, network, limits) for the 6 M1 containers, from cAdvisor.
+  - job_name: cadvisor
+    metrics_path: /metrics
+    # cAdvisor attaches its own sample timestamps. With honor_timestamps: true Prometheus writes no
+    # staleness markers for such series, so after "docker compose stop payments" the container series
+    # of payments would keep appearing in queries for 5 more minutes. false = scrape time is used and
+    # series disappear at the next scrape after a container is gone.
+    honor_timestamps: false
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # 1) Keep only series of the 6 M1 containers; everything else (root cgroup, machine_* metrics,
+      #    prometheus/cadvisor/loadtest/tests containers, later observability containers) is dropped.
+      #    Series without the label (root cgroup, machine_*) have an empty value and do not match.
+      - source_labels: [container_label_sentinelops_service]
+        regex: "gateway|orders|payments|inventory|postgres|redis"
+        action: keep
+      # 2) Expose the service name as label "service", the same label the M1 application metrics use.
+      #    This is a METRIC label set here after the scrape, not a target label (see gotcha above).
+      - source_labels: [container_label_sentinelops_service]
+        regex: "(.+)"
+        target_label: service
+        replacement: "$1"
+        action: replace
 
   # Prometheus monitors itself (its own scrape health, TSDB size, ...).
   - job_name: prometheus
