@@ -353,9 +353,66 @@ services:
       sentinelops.tier: observability
     networks: [sentinelops]
 
+  # Log database (single binary, filesystem storage). Receives logs from Alloy, queried by Grafana (CP4) and M5.
+  # No healthcheck: the Loki image is distroless (no shell, wget or curl). Readiness check from the host:
+  # GET http://127.0.0.1:3100/ready  (it returns 503 "Ingester not ready" for about 15 s after start).
+  loki:
+    profiles: ["observability"]
+    image: grafana/loki:3.7.8   # pinned exact tag, never "latest"
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    ports:
+      - "127.0.0.1:3100:3100"   # localhost only
+    volumes:
+      # Directory mount, same reason as for prometheus. This hides the image's own /etc/loki/local-config.yaml.
+      - ./observability/loki:/etc/loki:ro
+      - loki-data:/loki   # runs as uid 10001; the image owns /loki with that uid, so the volume is writable
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    labels:
+      sentinelops.service: loki
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
+  # Log collector (replaces the end-of-life Promtail): reads container logs through the Docker API and pushes to Loki.
+  # No healthcheck: the Alloy image has neither wget nor curl. Check from the host (override file publishes the port):
+  # GET http://127.0.0.1:12345/-/ready
+  # The image runs as root, which is what allows reading the Docker socket.
+  alloy:
+    profiles: ["observability"]
+    image: grafana/alloy:v1.20.1   # pinned exact tag, never "latest"
+    restart: unless-stopped
+    command:
+      - "run"
+      - "/etc/alloy/config.alloy"
+      - "--storage.path=/var/lib/alloy/data"
+      - "--server.http.listen-addr=0.0.0.0:12345"   # default is 127.0.0.1 inside the container, unreachable from outside
+      - "--disable-reporting"                       # no usage reporting to Grafana
+    volumes:
+      - ./observability/alloy:/etc/alloy:ro
+      # Docker API access to list containers and read their logs. ":ro" on a socket does not limit API access;
+      # Alloy only reads. Same exposure as cadvisor, hence profile-gated and with no published port in this file.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_started   # Loki has no healthcheck; Alloy retries pushes until Loki is ready
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    labels:
+      sentinelops.service: alloy
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
 volumes:
   pgdata:
   prometheus-data:
+  loki-data:
 
 networks:
   sentinelops:

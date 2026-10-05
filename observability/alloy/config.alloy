@@ -1,0 +1,77 @@
+// Grafana Alloy log pipeline for SentinelOps (module M2):
+//   Docker socket -> choose containers + build labels -> read "level" from JSON -> Loki
+// Reload after edits: docker compose --profile observability restart alloy
+// (or POST http://127.0.0.1:12345/-/reload when the override file publishes port 12345)
+
+// 1) Discover all running containers through the Docker API (socket mounted read-only).
+discovery.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "5s"
+}
+
+// 2) Choose containers and build the Loki labels from the Docker labels.
+discovery.relabel "sentinelops" {
+	targets = discovery.docker.containers.targets
+
+	// Keep only containers with sentinelops.tier = app or infra.
+	// Containers without the label and the observability tier itself are dropped here.
+	rule {
+		source_labels = ["__meta_docker_container_label_sentinelops_tier"]
+		regex         = "app|infra"
+		action        = "keep"
+	}
+
+	// loadtest and tests are tier "infra" but ephemeral: do not collect them.
+	rule {
+		source_labels = ["__meta_docker_container_label_sentinelops_service"]
+		regex         = "loadtest|tests"
+		action        = "drop"
+	}
+
+	// Loki labels (low cardinality only): service, container, tier. "level" is added in step 4.
+	rule {
+		source_labels = ["__meta_docker_container_label_sentinelops_service"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_sentinelops_tier"]
+		target_label  = "tier"
+	}
+}
+
+// 3) Read the logs of the chosen containers (Docker logs API, stdout and stderr).
+loki.source.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	targets          = discovery.relabel.sentinelops.output
+	forward_to       = [loki.process.levels.receiver]
+	refresh_interval = "5s"
+}
+
+// 4) Take the JSON field "level" (INFO, WARNING, ERROR, ...) of the app logs as label "level".
+//    postgres and redis lines are not JSON: nothing is extracted, so they simply have no level label.
+//    request_id, event, path, status ... are NOT extracted: they stay in the line ("| json" at query time).
+loki.process "levels" {
+	forward_to = [loki.write.local.receiver]
+
+	stage.json {
+		expressions = {level = "level"}
+	}
+
+	stage.labels {
+		values = {level = ""}
+	}
+}
+
+// 5) Send to Loki inside the Docker network.
+loki.write "local" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

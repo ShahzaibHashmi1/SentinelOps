@@ -1,8 +1,8 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** 2026-10-04
-**Current module:** M2 (Observability stack), in progress: CP1 and CP2 done and verified. M1 (Target application) is done and verified
+**Last updated:** 2026-10-05
+**Current module:** M2 (Observability stack), in progress: CP1 to CP3 done and verified. M1 (Target application) is done and verified
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -111,7 +111,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
 | M1 | Target application | 1 | Done (verified) | CP1 to CP4 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop; normal-load baseline in `docs/BASELINE.md`. Prompt: `prompts/M1_target_app.md` |
-| M2 | Observability stack | 1 | In progress | CP1 and CP2 done and verified: Prometheus (v3.15.0) scrapes the 4 app services, itself and cAdvisor (v0.60.6, containerd socket mounted for Docker Desktop) with a `service` label on container series. CP3 (Loki + Alloy) next. Prompt: `prompts/M2_observability.md` |
+| M2 | Observability stack | 1 | In progress | CP1 to CP3 done and verified: Prometheus (v3.15.0), cAdvisor (v0.60.6, containerd socket mounted for Docker Desktop) and Loki (3.7.8) + Alloy (v1.20.1) log pipeline with labels service, container, tier, level. CP4 (Grafana + Overview dashboard) next. Prompt: `prompts/M2_observability.md` |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
 | M5 | Evidence builder and dependency graph | 2 | Not started | |
@@ -165,12 +165,16 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D28 | 2026-10-04 | cAdvisor pinned to ghcr.io/google/cadvisor:v0.60.6, privileged, no published port in the base file; flags: docker_only, housekeeping 5s, no dynamic housekeeping, whitelisted labels, enable_metrics=cpu,memory,network. On Docker Desktop (WSL2) with the containerd image store the VM's /run/containerd/containerd.sock is mounted read-only into the container | Reproducible; fresh data every 5s scrape; only the metric groups we use. Without the containerd socket cAdvisor registers no docker factory (verified on the owner's machine). The mount gives cAdvisor privileged containerd access, like docker.sock; the path may not exist on other hosts |
 | D29 | 2026-10-04 | cadvisor scrape job: honor_timestamps false; metric_relabel keeps only series whose container_label_sentinelops_service is one of the 6 M1 services and copies it to the metric label "service" | Series of stopped containers disappear at the next scrape; consistent "service" label across app and container metrics; limits cardinality |
 | D30 | 2026-10-04 | cAdvisor debug port 127.0.0.1:8081 is published only in docker-compose.override.yml | Production-like runs (-f docker-compose.yml) expose nothing extra |
+| D31 | 2026-10-05 | Loki pinned to grafana/loki:3.7.8: single binary, auth off, filesystem, TSDB schema v13, 7-day retention via compactor, usage reporting off, discover_service_name [] and discover_log_levels false, localhost-only port 3100 | Same retention as Prometheus; the label set stays exactly service, container, tier, level |
+| D32 | 2026-10-05 | Alloy pinned to grafana/alloy:v1.20.1 with --disable-reporting; reads the Docker socket read-only; keeps containers with tier app or infra, drops service loadtest and tests; labels service, container, tier; level taken from the JSON field "level" | Collects only M1 containers; app logs have a level label, postgres and redis (not JSON) have none |
+| D33 | 2026-10-05 | request_id, event, path, status stay inside the log line and are read with explicit "| json field=\"field\""; a plain "| json" would rename the fields service and level to service_extracted and level_extracted | Never use high-cardinality values as labels; avoids the clash with the stream labels |
+| D34 | 2026-10-05 | No healthcheck for loki (distroless image) and alloy (no wget or curl); readiness is checked over HTTP (Loki /ready, Alloy /-/ready); Alloy debug port 12345 only in docker-compose.override.yml; alloy depends_on loki with service_started | Follows the prompt rule for images without tools; --wait waits only for "running" for these two |
 
 ## 9. Current focus
 
 - **Module:** M2 Observability stack (in progress)
-- **Last completed:** M2 CP2 (cAdvisor + service-labelled container series, containerd socket mount), verified on the owner's Docker Desktop
-- **Next task:** M2 CP3: Loki + Alloy log pipeline. Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
+- **Last completed:** M2 CP3 (Loki + Alloy log pipeline), verified on the owner's Docker Desktop
+- **Next task:** M2 CP4: Grafana provisioning, the Overview dashboard, GRAFANA_ADMIN_PASSWORD (DoD 5 and 6). For CP5 the AI needs scripts/smoke_test.py (to send a request with a known request id). Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
 
 ## 10. Known issues
 
@@ -188,6 +192,11 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - Idle CPU of the app services is not zero: cAdvisor shows about 11 to 13 % of the CPU limit (1-minute average) per app service on an otherwise idle stack, while single `docker stats` samples jump between about 0.1 % and 36 % of a core. Likely cause: the 5-second healthchecks (a Python process each time) and the 5-second Prometheus scrape. Use averaging windows of at least 30 s for CPU thresholds in M4.
 - cAdvisor on Docker Desktop (WSL2) with the containerd image store registers no docker factory unless the VM's /run/containerd/containerd.sock is mounted into the cadvisor container (log symptom: "unable to create containerd client ... no such file or directory"). On hosts without that path Docker creates an empty directory there; adjust or remove the mount.
 - The docker.sock and containerd.sock mounts give cAdvisor privileged access to the container runtime; ":ro" does not restrict API access.
+- Loki labels are service, container, tier, level only. In LogQL use explicit extraction (`| json request_id="request_id"`) or the stream labels: a plain `| json` renames the JSON fields service and level to service_extracted and level_extracted.
+- Loki /ready returns 503 for about 15 s after start. loki and alloy have no healthcheck (images without shell tools), so `docker compose ps` shows them Up without (healthy); `--wait` only waits for "running" for these two.
+- Alloy shows its components as healthy even when the Docker socket cannot be read; the failure appears only as "Unable to refresh target groups" errors in its log.
+- postgres and redis log rarely; right after a start they may have no lines in Loki. Alloy positions are not persisted, so logs written while Alloy is down may be missed.
+- Never use request_id, path or event as a Loki label.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

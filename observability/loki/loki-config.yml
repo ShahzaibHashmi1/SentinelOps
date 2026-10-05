@@ -1,0 +1,61 @@
+# Loki configuration for SentinelOps (module M2): single binary, filesystem storage, one tenant.
+# Reload: Loki has no reload endpoint, restart it:  docker compose --profile observability restart loki
+#
+# LABEL CONTRACT (set by Alloy, see observability/alloy/config.alloy): service, container, tier, level.
+# Everything else (request_id, event, path, status, ...) stays INSIDE the log line and is read at
+# query time with "| json". Never turn request_id, path or event into a label (cardinality).
+
+auth_enabled: false          # no tenants: every client uses the single built-in tenant
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn            # Loki's own logs: warnings and errors only
+
+common:
+  instance_addr: 127.0.0.1   # single process, everything talks over localhost
+  path_prefix: /loki         # the named volume "loki-data" is mounted here
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+# TSDB index with schema v13 (current recommended schema), daily index files.
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Retention: the compactor deletes data older than limits_config.retention_period.
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+  retention_delete_delay: 2h
+
+limits_config:
+  retention_period: 168h               # 7 days, same as Prometheus
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # Laptop-sized rate limits (the app logs a few hundred KB per minute under load).
+  ingestion_rate_mb: 8                 # per second, whole tenant
+  ingestion_burst_size_mb: 16
+  per_stream_rate_limit: 5MB           # per second, one stream
+  per_stream_rate_limit_burst: 10MB
+  max_entries_limit_per_query: 5000    # upper bound for the "limit" of a query
+  # Keep the label set exactly as documented. Both are Loki 3.x conveniences we do not want:
+  discover_service_name: []            # would add a duplicate label "service_name" next to "service"
+  discover_log_levels: false           # would add a second, lower-case level ("detected_level")
+
+# Usage statistics are not sent to the internet.
+analytics:
+  reporting_enabled: false

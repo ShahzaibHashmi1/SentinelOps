@@ -14,3 +14,6 @@ services:
   cadvisor:   # only exists with --profile observability; debug access to the raw cAdvisor metrics
     ports:
       - "127.0.0.1:8081:8080"
+  alloy:      # only exists with --profile observability; debug UI and /-/ready of the log collector
+    ports:
+      - "127.0.0.1:12345:12345"
