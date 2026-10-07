@@ -1,8 +1,8 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** 2026-10-05
-**Current module:** M2 (Observability stack), in progress: CP1 to CP3 done and verified. M1 (Target application) is done and verified
+**Last updated:** 2026-10-06
+**Current module:** M2 (Observability stack), in progress: CP1 to CP4 done and verified. M1 (Target application) is done and verified
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -111,7 +111,7 @@ Later modules add: `observability/`, `chaos/`, `detector/`, `agent/`, `kb/`, `re
 | ID | Module | Tier | Status | Notes |
 |----|--------|------|--------|-------|
 | M1 | Target application | 1 | Done (verified) | CP1 to CP4 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop; normal-load baseline in `docs/BASELINE.md`. Prompt: `prompts/M1_target_app.md` |
-| M2 | Observability stack | 1 | In progress | CP1 to CP3 done and verified: Prometheus (v3.15.0), cAdvisor (v0.60.6, containerd socket mounted for Docker Desktop) and Loki (3.7.8) + Alloy (v1.20.1) log pipeline with labels service, container, tier, level. CP4 (Grafana + Overview dashboard) next. Prompt: `prompts/M2_observability.md` |
+| M2 | Observability stack | 1 | In progress | CP1 to CP4 done and verified (CP3: commit 6c30ce7): Prometheus, cAdvisor (containerd socket mounted), Loki + Alloy, and Grafana (13.2.3) with the provisioned SentinelOps Overview dashboard. CP5 (Service Detail dashboard, check script, docs) next. Prompt: `prompts/M2_observability.md` |
 | M3 | Chaos / fault injection | 1→2 | Not started | |
 | M4 | Detection and correlation | 1→2 | Not started | |
 | M5 | Evidence builder and dependency graph | 2 | Not started | |
@@ -169,12 +169,15 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D32 | 2026-10-05 | Alloy pinned to grafana/alloy:v1.20.1 with --disable-reporting; reads the Docker socket read-only; keeps containers with tier app or infra, drops service loadtest and tests; labels service, container, tier; level taken from the JSON field "level" | Collects only M1 containers; app logs have a level label, postgres and redis (not JSON) have none |
 | D33 | 2026-10-05 | request_id, event, path, status stay inside the log line and are read with explicit "| json field=\"field\""; a plain "| json" would rename the fields service and level to service_extracted and level_extracted | Never use high-cardinality values as labels; avoids the clash with the stream labels |
 | D34 | 2026-10-05 | No healthcheck for loki (distroless image) and alloy (no wget or curl); readiness is checked over HTTP (Loki /ready, Alloy /-/ready); Alloy debug port 12345 only in docker-compose.override.yml; alloy depends_on loki with service_started | Follows the prompt rule for images without tools; --wait waits only for "running" for these two |
+| D35 | 2026-10-06 | Grafana pinned to grafana/grafana:13.2.3 (Alpine variant), localhost-only port 3000, admin login from GRAFANA_ADMIN_PASSWORD (default change_me_dev_only), anonymous access off; usage reporting, update checks, news feed, feedback links, gravatar and plugin preinstall disabled; healthcheck is curl on /api/health | Reproducible; no data sent to the internet; the missing-variable default never breaks the M1-only workflow |
+| D36 | 2026-10-06 | Datasources (uids prometheus, loki) and dashboards (folder SentinelOps, files in observability/grafana/dashboards) are provisioned from files; UI edits allowed (allowUiUpdates), changed files re-read every 10 s | Works with no clicking after "up"; dashboards stay in git |
+| D37 | 2026-10-06 | Overview queries use 1-minute windows and exclude the routes /health, /ready and /metrics from traffic panels; 5xx % uses "or ... * 0" so services without errors show 0; metrics without a service label are grouped by job | Numbers compare with docs/BASELINE.md; no gaps in error panels |
 
 ## 9. Current focus
 
 - **Module:** M2 Observability stack (in progress)
-- **Last completed:** M2 CP3 (Loki + Alloy log pipeline), verified on the owner's Docker Desktop
-- **Next task:** M2 CP4: Grafana provisioning, the Overview dashboard, GRAFANA_ADMIN_PASSWORD (DoD 5 and 6). For CP5 the AI needs scripts/smoke_test.py (to send a request with a known request id). Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
+- **Last completed:** M2 CP4 (Grafana provisioning + SentinelOps Overview dashboard), verified on the owner's Docker Desktop
+- **Next task:** M2 CP5: Service Detail dashboard, scripts/observability_check.py, docs/OBSERVABILITY.md, README section, failure-visibility and overhead checks, final PROJECT_CONTEXT.md update with sections 2b, 3 and 6 (DoD 1, 7, 8, 9). Prompt: `prompts/M2_observability.md`. M2 must not require changes to the M1 service code.
 
 ## 10. Known issues
 
@@ -197,6 +200,12 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - Alloy shows its components as healthy even when the Docker socket cannot be read; the failure appears only as "Unable to refresh target groups" errors in its log.
 - postgres and redis log rarely; right after a start they may have no lines in Loki. Alloy positions are not persisted, so logs written while Alloy is down may be missed.
 - Never use request_id, path or event as a Loki label.
+- Grafana's admin password from GRAFANA_ADMIN_PASSWORD only applies when the grafana-data volume is first created. Change it later with: `docker compose --profile observability exec grafana grafana cli admin reset-admin-password <new>`. Do not use "$" in the value.
+- Overview panels use 1-minute rate windows: values lag a change by up to a minute and are unreliable during the first 1 to 2 minutes after a start. The "up" panels react within one scrape (5 s).
+- The Overview table shows postgres and redis with CPU and memory only (no scrape target, so Up is n/a).
+- Dashboards edited in the Grafana UI are stored in the Grafana database; a changed JSON file in observability/grafana/dashboards overrides them within 10 s.
+- Verified on the owner's machine with 1-minute averages (20 users, full stack): CPU % of limit is highest for orders (about 44 %) and the gateway (about 40 %), then inventory (about 30 %) and payments (about 20 %). The earlier note that inventory is the busiest service came from a single `docker stats` sample and is wrong; docs/BASELINE.md carries the correction. Gateway p95 with the full observability stack is about 160 ms (Locust, whole run) to 203 ms (dashboard, 1-minute window) against 120 ms without the stack, so M2 Definition of Done 6 should use a p95 limit of 250 ms.
+- Overview cosmetics to fix in CP5: the Up cell for postgres and redis shows a red "n/a" (no scrape target; make it neutral); with no traffic the p95 column of the table shows "NaN" (histogram_quantile of a zero rate; show "-" or "no traffic") and the gateway p95 stat keeps showing the last value (88.7 ms seen while requests/s was 0.0).
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

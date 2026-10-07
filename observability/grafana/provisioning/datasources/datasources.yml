@@ -1,0 +1,24 @@
+# Grafana datasources (module M2), provisioned from this file: no manual setup in the UI.
+# The uids are fixed on purpose: dashboards and later modules refer to them ("prometheus", "loki").
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy                  # Grafana's backend queries Prometheus (browser never talks to it)
+    url: http://prometheus:9090    # service name on the Docker network "sentinelops"
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s             # = Prometheus scrape_interval; smallest useful query step
+      httpMethod: POST
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000

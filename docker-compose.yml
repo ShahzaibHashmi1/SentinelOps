@@ -409,10 +409,56 @@ services:
       sentinelops.tier: observability
     networks: [sentinelops]
 
+  # Dashboards. Datasources and dashboards are provisioned from files (observability/grafana/), no manual setup.
+  # Login: user "admin", password GRAFANA_ADMIN_PASSWORD from .env (default change_me_dev_only).
+  # The password only takes effect when the grafana-data volume is created; to change it later run
+  #   docker compose --profile observability exec grafana grafana cli admin reset-admin-password <new>
+  # Do not use a "$" in the password (Compose would treat it as a variable).
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:13.2.3   # pinned exact tag (Alpine variant, which contains curl), never "latest"
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change_me_dev_only}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"            # the browser would otherwise ask gravatar.com for the admin avatar
+      GF_AUTH_ANONYMOUS_ENABLED: "false"              # login is always required
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # No data sent to the internet: usage reporting, update checks, news feed, feedback links, plugin preinstall.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"          # Grafana 13 would otherwise download extra plugins at start
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+    ports:
+      - "127.0.0.1:3000:3000"   # localhost only
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro   # outside /var/lib/grafana (the data volume)
+      - grafana-data:/var/lib/grafana   # "docker compose down -v" deletes this volume
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    labels:
+      sentinelops.service: grafana
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
 volumes:
   pgdata:
   prometheus-data:
   loki-data:
+  grafana-data:
 
 networks:
   sentinelops:

@@ -1,0 +1,14 @@
+# Dashboard provider (module M2): Grafana loads every *.json file from the mounted folder.
+# The folder is mounted from observability/grafana/dashboards (see docker-compose.yml).
+apiVersion: 1
+
+providers:
+  - name: sentinelops
+    orgId: 1
+    folder: SentinelOps
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true           # panels can be edited and saved in the UI (stored in the Grafana database)
+    updateIntervalSeconds: 10      # a changed JSON file is picked up within 10 s, no restart needed
+    options:
+      path: /etc/grafana/dashboards
