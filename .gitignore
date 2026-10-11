@@ -17,3 +17,8 @@ loadtest/results/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Chaos module (M3): runtime output and generated overrides
+chaos/data/
+chaos/overrides/
+__pycache__/

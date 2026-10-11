@@ -2,7 +2,7 @@
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
 **Last updated:** 2026-10-11
-**Current module:** M3 (Chaos / fault injection), not started. M1 (Target application) and M2 (Observability stack) are done and verified
+**Current module:** M3 (Chaos / fault injection), in progress: CP1 done and verified, CP2 to CP5 open. M1 (Target application) and M2 (Observability stack) are done and verified
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -128,7 +128,7 @@ Later modules add: `chaos/`, `detector/`, `agent/`, `kb/`, `remediation/`, `api/
 |----|--------|------|--------|-------|
 | M1 | Target application | 1 | Done (verified) | CP1 to CP4 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop; normal-load baseline in `docs/BASELINE.md`. Prompt: `prompts/M1_target_app.md` |
 | M2 | Observability stack | 1 | Done (verified) | CP1 to CP5 done; Definition of Done 1 to 9 verified on the owner's Docker Desktop (check script 29/29; overhead and failure test recorded in `docs/OBSERVABILITY.md` section 9). Contract for later modules: `docs/OBSERVABILITY.md`. Prompt: `prompts/M2_observability.md` |
-| M3 | Chaos / fault injection | 1→2 | Not started | |
+| M3 | Chaos / fault injection | 1→2 | In progress | CP1 done and verified (catalogue of 8 faults, CLI list/status/inject/clear/run, ground truth, safety checks, F10, F13); CP2 to CP5 open. Prompt: `prompts/M3_chaos.md` |
 | M4 | Detection and correlation | 1→2 | Not started | |
 | M5 | Evidence builder and dependency graph | 2 | Not started | |
 | M6 | LLM RCA agent | 1→3 | Not started | |
@@ -193,12 +193,16 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D40 | 2026-10-07 | Service Detail dashboard (uid sentinelops-service-detail): custom variable `service`, text variable `request_id` (empty = all lines, filter `request_id=~".*$request_id.*"` after `| json request_id="request_id"`); one extra panel "Requests/s by status code" so 502/504 are visible | The prompt lists per-route, dependency, container and logs panels; the status panel is needed for the failure-visibility check (DoD 7) |
 | D41 | 2026-10-07 | `scripts/observability_check.py` is standard library only; it sends one real order (1 x SKU-001, own X-Request-ID) through the gateway and finds that id with LogQL in all four app services; postgres and redis log recency is checked over 24 h, app services over 10 min; Grafana is checked through its HTTP API with the admin password from `.env` | Same constraints as the smoke test (host Python 3.14, no packages); postgres and redis log rarely |
 | D42 | 2026-10-07 | Overhead of the observability containers is measured with `docker stats` sampling during the 5-minute load test, not with Prometheus | cAdvisor series for containers other than the six M1 services are dropped by D29 |
+| D43 | 2026-10-11 | Tier 1 contains exactly 8 faults of the proposal catalogue: F01, F02, F06, F08, F10, F11, F13, F18. The other 13 (F03, F04, F05, F07, F09, F12, F14 to F17, F19 to F21) are tier 2 and not built now | Each of the 8 can be injected without changing M1 service code and without a new container |
+| D44 | 2026-10-11 | The fault runner is a command-line tool (standard library only) that calls the docker and docker compose CLIs through subprocess. No Docker SDK, stress-ng, Toxiproxy or HTTP trigger API in tier 1 | Host Python has no packages (stdlib rule); the HTTP trigger is built when M10 needs it |
+| D45 | 2026-10-11 | Ground truth is append-only JSON lines in `chaos/data/ground_truth.jsonl` (events inject, clear, recovered, aborted). The inject and clear timestamps are taken just before the first docker action; recovery_s = seconds from the clear timestamp to the recovered timestamp. Active state (`chaos/data/active.json`) is written before the docker action | M12 computes MTTD and MTTR from these lines; a crash or Ctrl+C can always be cleared |
+| D46 | 2026-10-11 | Catalogue conventions: `$target` placeholder in expected_root_cause.service and in symptom queries, default_duration_s null = the fault stays until clear, symptom `source` is prometheus or loki, an empty query result counts as 0 | One schema for the CLI, chaos_check.py and M4/M12 |
 
 ## 9. Current focus
 
-- **Module:** none in progress; M3 Chaos / fault injection is next
-- **Last completed:** M2 CP5 (Service Detail dashboard, check script, docs, README section), verified on the owner's Docker Desktop on 2026-10-11; M2 is Done (verified)
-- **Next task:** write `prompts/M3_chaos.md` in the same format as `prompts/M1_target_app.md` and `prompts/M2_observability.md` (scope decision with the owner first; labelled fault catalogue in `docs/PROPOSAL.md` section 8, tier 1 starts with 8 faults), then start the M3 builder chat with `PROJECT_CONTEXT.md` and that prompt.
+- **Module:** M3 Chaos / fault injection, in progress
+- **Last completed:** M3 CP1 (catalogue, CLI, ground truth, F10, F13), verified on the owner's Docker Desktop on 2026-10-11: 63 unit tests, refusals, F10 and F13 symptoms and recovery, stale state, `clear --all`, `run` with Ctrl+C, smoke test 22/22, observability check 29/29
+- **Next task:** M3 CP2 (F01 CPU saturation in orders, F02 memory growth in payments). Request for the builder: mask only known password patterns in the ground-truth file (see section 10)
 
 ## 10. Known issues
 
@@ -233,6 +237,12 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - Do not wrap `docker compose up` in PowerShell `Measure-Command`: Compose v5.5.1 then exits at once with "failed to get console: The handle is invalid." and starts nothing. Time it with `Get-Date` before and after instead. Clean start with the profile took about 30 s.
 - Observed once: the first run of `scripts/observability_check.py`, about 4 minutes after the start, got HTTP 503 from Loki /ready; the next two runs passed. Cause not found; the script has no retry. If it recurs, collect `docker compose --profile observability logs --no-log-prefix loki --tail 50` right away.
 - Overview cosmetics (neutral Up cell for postgres and redis, `-` instead of NaN for p95, p95 stat without stale value) were fixed in CP5 (D39). The p95 stat has no sparkline any more because it uses an instant query.
+- M3 CP1: `expected_symptoms` of F01, F02, F06, F08, F11 and F18 are drafts; each is calibrated in the checkpoint that builds the fault. Verified on the owner's machine: the F10 symptoms (postgres series 0 within 10 s; gateway 5xx % 10.5 at 10 s and 100 % from 80 s with 10 load-test users; orders/inventory WARNING/ERROR lines rising) and the F13 symptoms (`dependency_requests_total{dependency="redis",outcome!="success"}` about 4.5 per s; Loki lines matching "redis" in inventory/payments). Both faults recovered 7.7 s and 7.8 s after the clear.
+- M3 CP1 finding: with Redis down the gateway 5xx % stayed at 0.0 for 90 s (the services degrade, see the /ready note above). Detection of F13 must use dependency failures, logs and /ready, not the error rate.
+- Do not run `scripts/smoke_test.py` while a background load test is running: its stock check ("stock decreased by the ordered quantity") fails because the load test orders the same SKU-001 (seen: 984 -> 980).
+- M3 CP1: `clear --all` restarts stopped containers but cannot yet recreate a service changed by a fault file (F06/F08, CP3). Faults that stay until clear (F06, F08, F10, F13) reject --duration; timed experiments use `run --hold`.
+- M3 CP1: `mask_secrets` replaces every occurrence of a .env secret value in printed output and in ground-truth lines. A password equal to a printed word (for example "postgres") would corrupt the target field. The owner's POSTGRES_PASSWORD was checked and does not occur in `chaos/` files. CP2 restricts the ground-truth masking to known password patterns.
+- `chaos/data/` (git-ignored) holds the test events written during CP1 verification (the inject/clear/recovered/aborted lines of the F10 and F13 runs); delete the folder before evaluation runs so that the ground truth only contains real experiments.
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

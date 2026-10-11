@@ -1,0 +1,240 @@
+[
+  {
+    "id": "F01",
+    "name": "CPU saturation",
+    "category": "Resource",
+    "description": "Busy-loop Python processes inside the orders container push its CPU to the container limit.",
+    "default_target": "orders",
+    "allowed_targets": ["orders"],
+    "default_duration_s": 180,
+    "max_duration_s": 600,
+    "params": [
+      {"name": "processes", "default": 2, "min": 1, "max": 4}
+    ],
+    "expected_root_cause": {"service": "$target", "type": "cpu_exhaustion"},
+    "expected_action": "restart_service",
+    "acceptable_actions": ["restart_service", "scale_service"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "100 * sum(rate(container_cpu_usage_seconds_total{service=\"$target\"}[1m])) / (max(container_spec_cpu_quota{service=\"$target\"}) / max(container_spec_cpu_period{service=\"$target\"}))",
+        "condition": "> 85",
+        "within_s": 90
+      }
+    ]
+  },
+  {
+    "id": "F02",
+    "name": "Memory growth",
+    "category": "Resource",
+    "description": "A Python process inside the payments container allocates memory in steps up to 90 % of the container limit, then holds.",
+    "default_target": "payments",
+    "allowed_targets": ["payments"],
+    "default_duration_s": 240,
+    "max_duration_s": 600,
+    "params": [
+      {"name": "step_mib", "default": 8, "min": 1, "max": 32},
+      {"name": "interval_s", "default": 2, "min": 1, "max": 10}
+    ],
+    "expected_root_cause": {"service": "$target", "type": "memory_exhaustion"},
+    "expected_action": "restart_service",
+    "acceptable_actions": ["restart_service"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "100 * max(container_memory_working_set_bytes{service=\"$target\"}) / max(container_spec_memory_limit_bytes{service=\"$target\"})",
+        "condition": "> 80",
+        "within_s": 120
+      }
+    ]
+  },
+  {
+    "id": "F06",
+    "name": "Missing environment variable (crash loop)",
+    "category": "Configuration",
+    "description": "The service is recreated without DATABASE_URL, fails at startup with its own required-variable error and restarts in a loop.",
+    "default_target": "inventory",
+    "allowed_targets": ["orders", "payments", "inventory"],
+    "default_duration_s": null,
+    "max_duration_s": 600,
+    "params": [],
+    "expected_root_cause": {"service": "$target", "type": "misconfiguration"},
+    "expected_action": "revert_config",
+    "acceptable_actions": ["revert_config"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "min(up{job=\"$target\"})",
+        "condition": "== 0",
+        "within_s": 30
+      },
+      {
+        "source": "loki",
+        "query": "sum(count_over_time({service=\"$target\"} |~ \"(?i)required\" [2m]))",
+        "condition": "> 0",
+        "within_s": 60
+      }
+    ]
+  },
+  {
+    "id": "F08",
+    "name": "Invalid database credential",
+    "category": "Configuration",
+    "description": "The service is recreated with a wrong password in DATABASE_URL. It starts, but every database query fails with an authentication error. The real password is not changed.",
+    "default_target": "orders",
+    "allowed_targets": ["orders", "payments", "inventory"],
+    "default_duration_s": null,
+    "max_duration_s": 600,
+    "params": [],
+    "expected_root_cause": {"service": "$target", "type": "db_auth_failure"},
+    "expected_action": "revert_config",
+    "acceptable_actions": ["revert_config"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "sum(rate(dependency_requests_total{job=\"$target\",dependency=\"postgres\",outcome!=\"success\"}[1m]))",
+        "condition": "> 0",
+        "within_s": 60
+      },
+      {
+        "source": "prometheus",
+        "query": "100 * (sum(rate(http_requests_total{service=\"gateway\",status=~\"5..\",route!~\"/(health|ready|metrics)\"}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), 0.001)",
+        "condition": "> 5",
+        "within_s": 90
+      },
+      {
+        "source": "loki",
+        "query": "sum(count_over_time({service=\"$target\"} |~ \"(?i)(password authentication|authentication failed)\" [2m]))",
+        "condition": "> 0",
+        "within_s": 60
+      }
+    ]
+  },
+  {
+    "id": "F10",
+    "name": "PostgreSQL down",
+    "category": "Dependency",
+    "description": "The postgres container is stopped (docker compose stop postgres). Data volumes are untouched.",
+    "default_target": "postgres",
+    "allowed_targets": ["postgres"],
+    "default_duration_s": null,
+    "max_duration_s": 600,
+    "params": [],
+    "expected_root_cause": {"service": "postgres", "type": "database_unavailable"},
+    "expected_action": "restart_service",
+    "acceptable_actions": ["restart_service"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "count(container_memory_working_set_bytes{service=\"postgres\"}) or vector(0)",
+        "condition": "== 0",
+        "within_s": 30
+      },
+      {
+        "source": "prometheus",
+        "query": "100 * (sum(rate(http_requests_total{service=\"gateway\",status=~\"5..\",route!~\"/(health|ready|metrics)\"}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), 0.001)",
+        "condition": "> 5",
+        "within_s": 90
+      },
+      {
+        "source": "loki",
+        "query": "sum(count_over_time({service=~\"orders|inventory\", level=~\"WARNING|ERROR\"} [2m]))",
+        "condition": "> 0",
+        "within_s": 60
+      }
+    ]
+  },
+  {
+    "id": "F11",
+    "name": "Lock contention",
+    "category": "Dependency",
+    "description": "A background psql session holds an ACCESS EXCLUSIVE lock on the items table, so stock reservations block until the 2 s timeouts fire.",
+    "default_target": "postgres",
+    "allowed_targets": ["postgres"],
+    "default_duration_s": 120,
+    "max_duration_s": 600,
+    "params": [],
+    "expected_root_cause": {"service": "postgres", "type": "db_lock_contention"},
+    "expected_action": "terminate_blocking_query",
+    "acceptable_actions": ["terminate_blocking_query"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"inventory\",route!~\"/(health|ready|metrics)\"}[1m])))",
+        "condition": "> 1",
+        "within_s": 90
+      },
+      {
+        "source": "prometheus",
+        "query": "100 * (sum(rate(http_requests_total{service=\"gateway\",status=~\"5..\",route!~\"/(health|ready|metrics)\"}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), 0.001)",
+        "condition": "> 5",
+        "within_s": 90
+      }
+    ]
+  },
+  {
+    "id": "F13",
+    "name": "Redis down",
+    "category": "Dependency",
+    "description": "The redis container is stopped (docker compose stop redis). Services keep serving in degraded mode (no cache, no idempotency fast path).",
+    "default_target": "redis",
+    "allowed_targets": ["redis"],
+    "default_duration_s": null,
+    "max_duration_s": 600,
+    "params": [],
+    "expected_root_cause": {"service": "redis", "type": "cache_unavailable"},
+    "expected_action": "restart_service",
+    "acceptable_actions": ["restart_service"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "count(container_memory_working_set_bytes{service=\"redis\"}) or vector(0)",
+        "condition": "== 0",
+        "within_s": 30
+      },
+      {
+        "source": "prometheus",
+        "query": "sum(rate(dependency_requests_total{dependency=\"redis\",outcome!=\"success\"}[1m]))",
+        "condition": "> 0",
+        "within_s": 60
+      },
+      {
+        "source": "loki",
+        "query": "sum(count_over_time({service=~\"inventory|payments\"} |~ \"(?i)redis\" [2m]))",
+        "condition": "> 0",
+        "within_s": 60
+      }
+    ]
+  },
+  {
+    "id": "F18",
+    "name": "Traffic spike",
+    "category": "Load",
+    "description": "The M1 load test image runs with more users than the baseline of 20 (default 100) against the gateway.",
+    "default_target": "gateway",
+    "allowed_targets": ["gateway"],
+    "default_duration_s": 120,
+    "max_duration_s": 600,
+    "params": [
+      {"name": "users", "default": 100, "min": 21, "max": 150},
+      {"name": "spawn_rate", "default": 20, "min": 1, "max": 50}
+    ],
+    "expected_root_cause": {"service": null, "type": "capacity_limit"},
+    "expected_action": "scale_service",
+    "acceptable_actions": ["scale_service"],
+    "expected_symptoms": [
+      {
+        "source": "prometheus",
+        "query": "sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m]))",
+        "condition": "> 30",
+        "within_s": 60
+      },
+      {
+        "source": "prometheus",
+        "query": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])))",
+        "condition": "> 0.3",
+        "within_s": 90
+      }
+    ]
+  }
+]
