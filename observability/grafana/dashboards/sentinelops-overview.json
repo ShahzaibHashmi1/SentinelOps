@@ -21,7 +21,7 @@
   },
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "fiscalYearStartMonth": 0,
   "liveNow": false,
   "templating": {
@@ -247,7 +247,7 @@
       "id": 4,
       "type": "stat",
       "title": "Gateway p95 latency",
-      "description": "95th percentile of the gateway request duration over the last minute (95% of requests were faster).",
+      "description": "95th percentile of the gateway request duration over the last minute (95% of requests were faster). Shows \"-\" when the gateway received no requests in the last minute.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -261,15 +261,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m]))) and on() (sum(rate(http_request_duration_seconds_count{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])) > 0)",
           "legendFormat": "",
           "editorMode": "code",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "instant": false,
-          "range": true
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
@@ -310,7 +310,7 @@
           "values": false
         },
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "textMode": "auto",
         "justifyMode": "auto",
         "orientation": "auto"
@@ -479,7 +479,7 @@
       "id": 8,
       "type": "table",
       "title": "Service health",
-      "description": "One row per service: scrape up/down, requests/s, 5xx %, p95 latency (app services only) and container CPU and memory as % of limit.",
+      "description": "One row per service: scrape up/down, requests/s, 5xx %, p95 latency (app services with traffic only) and container CPU and memory as % of limit. \"-\" means no value (no traffic, or the service has no metrics target).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -532,7 +532,7 @@
         },
         {
           "refId": "D",
-          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket{route!~\"/(health|ready|metrics)\"}[1m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket{route!~\"/(health|ready|metrics)\"}[1m]))) and on(service) (sum by (service) (rate(http_request_duration_seconds_count{route!~\"/(health|ready|metrics)\"}[1m])) > 0)",
           "legendFormat": "",
           "editorMode": "code",
           "datasource": {
@@ -674,6 +674,7 @@
                       "match": "null",
                       "result": {
                         "text": "n/a",
+                        "color": "transparent",
                         "index": 2
                       }
                     }
@@ -761,6 +762,22 @@
                   "type": "color-background",
                   "mode": "basic"
                 }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "-",
+                        "color": "transparent",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
               }
             ]
           },
@@ -804,6 +821,22 @@
                   "type": "color-background",
                   "mode": "basic"
                 }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "-",
+                        "color": "transparent",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
               }
             ]
           },

@@ -175,22 +175,41 @@ docker-compose.yml, docker-compose.override.yml, .env.example, PROJECT_CONTEXT.m
 | A container is not healthy | `docker compose logs --tail 30 <service>` |
 | Port 8000 already in use | Stop the other program, or change the left side of `127.0.0.1:8000:8000` in `docker-compose.yml` |
 
-## Observability (module M2, in progress)
+## Observability (module M2)
 
-Optional metrics stack, started with the compose profile `observability`. A plain `docker compose up -d --wait` still starts only the 6 M1 containers.
+Metrics, logs and dashboards for the six M1 containers. The observability containers are optional (compose profile `observability`); without the profile only the six M1 containers start.
 
-    docker compose --profile observability up -d --build --wait
+### Quick start (PowerShell, repo root)
 
-- Prometheus: http://localhost:9090 (targets: http://localhost:9090/targets)
-- More services (cAdvisor, Loki, Alloy, Grafana) and full documentation (docs/OBSERVABILITY.md) arrive in the next M2 checkpoints.
-- `docker compose down -v` also deletes the metrics data volume.
+```powershell
+Copy-Item .env.example .env          # first time only; set POSTGRES_PASSWORD (and optionally GRAFANA_ADMIN_PASSWORD)
+docker compose --profile observability up -d --build --wait
+python scripts/observability_check.py
+```
 
-## Observability (module M2, in progress)
+`docker compose ps` should list 11 containers (6 M1 + prometheus, cadvisor, loki, alloy, grafana). `loki` and `alloy` have no healthcheck and show `Up` without `(healthy)`. Wait about 90 seconds before judging rates on the dashboards.
 
-Optional metrics stack, started with the compose profile `observability`. A plain `docker compose up -d --wait` still starts only the 6 M1 containers.
+### Where to look
 
-    docker compose --profile observability up -d --build --wait
+| What | URL |
+|------|-----|
+| Grafana (login `admin` / `GRAFANA_ADMIN_PASSWORD` from `.env`, default `change_me_dev_only`) | http://127.0.0.1:3000 |
+| Dashboard: SentinelOps Overview | http://127.0.0.1:3000/d/sentinelops-overview |
+| Dashboard: SentinelOps Service Detail (choose the service at the top; paste a request id to filter the logs) | http://127.0.0.1:3000/d/sentinelops-service-detail |
+| Prometheus (targets: `/targets`) | http://127.0.0.1:9090 |
+| Loki readiness | http://127.0.0.1:3100/ready |
 
-- Prometheus: http://localhost:9090 (targets: http://localhost:9090/targets)
-- More services (cAdvisor, Loki, Alloy, Grafana) and full documentation (docs/OBSERVABILITY.md) arrive in the next M2 checkpoints.
-- `docker compose down -v` also deletes the metrics data volume.
+### Generate load and see it
+
+```powershell
+docker compose --profile load run --rm loadtest      # duration from DURATION in .env, about 19 requests/s with 20 users
+```
+
+### Stop and reset
+
+```powershell
+docker compose --profile observability down          # keeps data
+docker compose --profile observability down -v       # deletes the database, metrics, logs and Grafana data
+```
+
+Labels, queries, ports, limits, operations and known limitations are documented in [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md). On a host other than Docker Desktop (WSL2) check the cAdvisor containerd socket mount first (see that file, section 7).
