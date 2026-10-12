@@ -176,7 +176,7 @@
     "id": "F13",
     "name": "Redis down",
     "category": "Dependency",
-    "description": "The redis container is stopped (docker compose stop redis). Services keep serving in degraded mode (no cache, no idempotency fast path).",
+    "description": "The redis container is stopped (docker compose stop redis). The services keep serving in degraded mode (no cache, no idempotency fast path). Measured on the owner's machine in CP1: gateway 5xx stays at 0.0 %, redis dependency errors are about 4.5 per s, and the redis log lines in Loki keep rising. Do not expect a gateway error signature from this fault.",
     "default_target": "redis",
     "allowed_targets": ["redis"],
     "default_duration_s": null,

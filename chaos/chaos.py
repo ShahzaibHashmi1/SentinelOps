@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import time
 import uuid
@@ -51,6 +52,7 @@ SYMPTOM_SOURCES = ["prometheus", "loki"]
 SERVICES = faults.M1_SERVICES
 HARD_CAP_S = 600                  # no fault, warm-up, hold or cool-down may exceed this
 DEFAULT_HOLD_S = 60               # `run` hold time for faults that have no duration of their own
+RUN_END_MARGIN_S = 30             # `run`: a self-ending fault lasts hold + this, so that clear (not the timer) ends it
 TARGET_PLACEHOLDER = "$target"    # in expected_root_cause.service and in symptom queries
 
 REQUIRED_FIELDS = ["id", "name", "category", "description", "default_target", "allowed_targets",
@@ -300,12 +302,32 @@ _URL_PASSWORD_RE = re.compile(r"(://[^:/@\s]+:)[^@\s]+(@)")
 _KEY_VALUE_RE = re.compile(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN))(\s*[=:]\s*)\S+")
 
 
-def mask_secrets(text, secrets=()):
-    """Replace known secret values, passwords inside URLs and NAME_PASSWORD=value pairs by ***."""
-    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
-        text = text.replace(secret, "***")
+def mask_patterns(text):
+    """Mask only known password patterns: passwords inside URLs and NAME_PASSWORD=value pairs.
+
+    Used for the ground-truth file. It never replaces a plain word, so a secret that happens to
+    equal a printed word (for example "postgres") cannot corrupt the target field.
+    """
     text = _URL_PASSWORD_RE.sub(r"\1***\2", text)
     return _KEY_VALUE_RE.sub(r"\1\2***", text)
+
+
+def mask_secrets(text, secrets=()):
+    """For printed output: replace every known secret value, then the known password patterns."""
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        text = text.replace(secret, "***")
+    return mask_patterns(text)
+
+
+def mask_structure(value, mask):
+    """Apply a text mask to every string value of a nested dict/list (keys are left alone)."""
+    if isinstance(value, str):
+        return mask(value)
+    if isinstance(value, list):
+        return [mask_structure(item, mask) for item in value]
+    if isinstance(value, dict):
+        return {key: mask_structure(item, mask) for key, item in value.items()}
+    return value
 
 
 def load_env_secrets(path=ENV_PATH):
@@ -380,9 +402,10 @@ def make_event(event, record, fault, ts, **extra):
     return line
 
 
-def format_ground_truth_line(event, mask=lambda text: text):
-    """One JSON object as one line ending in \\n, with secrets masked."""
-    return mask(json.dumps(event, ensure_ascii=False, separators=(",", ":"))) + "\n"
+def format_ground_truth_line(event, mask=mask_patterns):
+    """One JSON object as one line ending in \\n. The mask is applied to the string values BEFORE
+    serialising, so a masked value can never break the JSON."""
+    return json.dumps(mask_structure(event, mask), ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def append_line(path, line):
@@ -418,14 +441,48 @@ def write_state(active, path=STATE_PATH):
     os.replace(temp, path)
 
 
-def fault_status(record, running):
+def fault_status(record, running, process_counts=None):
     """'active' or 'stale' (the effect is gone although the record still exists)."""
-    return "stale" if faults.effect_gone(record["fault_id"], record["target"], running) else "active"
+    gone = faults.effect_gone(record["fault_id"], record["target"], running, process_counts)
+    return "stale" if gone else "active"
 
 
 # ---------------------------------------------------------------------------
 # Context and commands
 # ---------------------------------------------------------------------------
+
+class InterruptGuard:
+    """While active, Ctrl+C is only counted: it does not raise KeyboardInterrupt.
+
+    `run` uses it around the clear, so that pressing Ctrl+C again cannot stop the tool before the
+    clear and recovered events are written. (docker children run in their own process group, see
+    faults.default_runner, so they do not receive the console Ctrl+C either.)
+    """
+
+    def __init__(self, say):
+        self.say = say
+        self.count = 0
+        self._old = None
+        self._installed = False
+
+    def _handler(self, _signum, _frame):
+        self.count += 1
+        if self.count == 1:
+            self.say("Ctrl+C received while clearing: finishing the clear and the recording first ...")
+
+    def __enter__(self):
+        try:
+            self._old = signal.signal(signal.SIGINT, self._handler)
+            self._installed = True
+        except ValueError:          # not the main thread: cannot install a handler
+            pass
+        return self
+
+    def __exit__(self, *_exc):
+        if self._installed:
+            signal.signal(signal.SIGINT, self._old)
+        return False
+
 
 @dataclass
 class Context:
@@ -436,7 +493,8 @@ class Context:
     sleep: object = time.sleep
     state_path: Path = STATE_PATH
     truth_path: Path = GROUND_TRUTH_PATH
-    mask: object = field(default=lambda text: text)
+    mask: object = field(default=lambda text: text)      # printed output: known secret values + patterns
+    mask_truth: object = field(default=mask_patterns)    # ground-truth file: patterns only
 
 
 def build_context():
@@ -448,7 +506,8 @@ def build_context():
     def say(message=""):
         print(mask(str(message)), flush=True)
 
-    return Context(catalogue=load_catalogue(), dk=Docker(echo=say, mask=mask), say=say, mask=mask)
+    return Context(catalogue=load_catalogue(), dk=Docker(echo=say, mask=mask), say=say, mask=mask,
+                   mask_truth=mask_patterns)
 
 
 def format_table(headers, rows):
@@ -465,7 +524,7 @@ def format_table(headers, rows):
 
 def emit(ctx, event, record, ts, **extra):
     fault = ctx.catalogue[record["fault_id"]]
-    line = format_ground_truth_line(make_event(event, record, fault, ts, **extra), ctx.mask)
+    line = format_ground_truth_line(make_event(event, record, fault, ts, **extra), ctx.mask_truth)
     append_line(ctx.truth_path, line)
 
 
@@ -480,6 +539,16 @@ def cmd_list(ctx, _args):
     return 0
 
 
+def effect_already_gone(ctx, record):
+    """True when the effect of a recorded fault is already gone (a 'late' clear). Unknown counts as not gone."""
+    try:
+        running = faults.running_services(faults.service_states(ctx.dk.ps()))
+        counts = faults.process_counts(ctx.dk, [record], running)
+    except FaultError:
+        return False
+    return fault_status(record, running, counts) == "stale"
+
+
 def cmd_status(ctx, _args):
     state = read_state(ctx.state_path)
     if not state:
@@ -487,17 +556,19 @@ def cmd_status(ctx, _args):
         return 0
     try:
         running = faults.running_services(faults.service_states(ctx.dk.ps()))
+        counts = faults.process_counts(ctx.dk, list(state.values()), running)
     except FaultError as exc:
         ctx.say(f"warning: cannot cross-check with docker ({exc}); showing the recorded state only")
         running = None
+        counts = {}
     rows = []
     for fid, record in state.items():
         age = format_age((datetime.now(timezone.utc) - parse_iso(record["started_ts"])).total_seconds())
-        status = fault_status(record, running) if running is not None else "unknown"
+        status = fault_status(record, running, counts) if running is not None else "unknown"
         rows.append([fid, record["target"], record["run_id"], age, status])
     ctx.say(format_table(["ID", "Target", "Run id", "Age", "State"], rows))
     if any(row[4] == "stale" for row in rows):
-        ctx.say("stale = the effect is gone (for example the container was restarted). "
+        ctx.say("stale = the effect is gone (container restarted, or the fault's duration is over). "
                 "Remove the record with: python chaos/chaos.py clear <ID>")
     return 0
 
@@ -510,7 +581,8 @@ def do_inject(ctx, request, mode="inject"):
     states = faults.service_states(dk.ps())
     if fid in state:
         record = state[fid]
-        status = fault_status(record, faults.running_services(states))
+        running = faults.running_services(states)
+        status = fault_status(record, running, faults.process_counts(dk, [record], running))
         if status == "stale":
             raise ValidationError(f"{fid} is recorded as active (run {record['run_id']}) but its effect is gone "
                                   f"(stale). Run first: python chaos/chaos.py clear {fid}")
@@ -550,20 +622,25 @@ def do_inject(ctx, request, mode="inject"):
 
 
 def do_clear(ctx, record):
-    """Undo one recorded fault. Returns (record, clear_ts). Leaves the record in place if the docker action fails."""
+    """Undo one recorded fault. Returns (record, clear_ts, late). Leaves the record if the docker action fails.
+
+    late = the effect was already gone before this clear (container restarted by hand, fault duration
+    over, an earlier clear that was interrupted). The clear and recovered events then carry "late": true.
+    """
     fid = record["fault_id"]
     if not record.get("inject_recorded"):
         # The injection was interrupted before its ground-truth line was written: write it now
         # (with the original timestamp) so that every experiment has an inject/clear pair.
         emit(ctx, "inject", record, record["started_ts"])
+    late = effect_already_gone(ctx, record)
     _inject_fn, clear_fn = faults.IMPLEMENTED[fid]
-    ts_clear = ctx.now()    # taken immediately before the first docker action of the clear
+    ts_clear = ctx.now()    # taken immediately before the first docker command that changes the stack
     clear_fn(ctx.dk, record)
-    emit(ctx, "clear", record, ts_clear)
+    emit(ctx, "clear", record, ts_clear, **({"late": True} if late else {}))
     state = read_state(ctx.state_path)
     state.pop(fid, None)
     write_state(state, ctx.state_path)
-    return record, ts_clear
+    return record, ts_clear, late
 
 
 def finish_recovery(ctx, cleared):
@@ -575,10 +652,12 @@ def finish_recovery(ctx, cleared):
         ctx.say(f"error: {exc}")
         return False
     ts_recovered = ctx.now()
-    for record, ts_clear in cleared:
+    for record, ts_clear, late in cleared:
         seconds = (parse_iso(ts_recovered) - parse_iso(ts_clear)).total_seconds()
-        emit(ctx, "recovered", record, ts_recovered, recovery_s=round(seconds, 1))
-        ctx.say(f"{record['fault_id']}: recovered {seconds:.1f} s after the clear")
+        emit(ctx, "recovered", record, ts_recovered, recovery_s=round(seconds, 1),
+             **({"late": True} if late else {}))
+        note = " (late clear: the effect was already gone)" if late else ""
+        ctx.say(f"{record['fault_id']}: recovered {seconds:.1f} s after the clear{note}")
     return True
 
 
@@ -587,7 +666,11 @@ def cmd_inject(ctx, args):
                                implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
     record = do_inject(ctx, request)
     ctx.say(f"injected {record['fault_id']} on {record['target']} (run id {record['run_id']})")
-    ctx.say(f"it stays until: python chaos/chaos.py clear {record['fault_id']}")
+    if request.duration_s is None:
+        ctx.say(f"it stays until: python chaos/chaos.py clear {record['fault_id']}")
+    else:
+        ctx.say(f"it ends by itself after {request.duration_s} s; end it earlier with: "
+                f"python chaos/chaos.py clear {record['fault_id']}")
     return 0
 
 
@@ -625,6 +708,13 @@ def cmd_clear(ctx, args):
         except FaultError as exc:
             failed = True
             ctx.say(f"error: {exc}")
+        try:
+            targets = {fid: ctx.catalogue[fid]["allowed_targets"] for fid in faults.PROCESS_FAULTS
+                       if fid in ctx.catalogue}
+            for fid, target in faults.sweep_process_faults(ctx.dk, targets):
+                ctx.say(f"ended leftover {fid} processes in {target}")
+        except FaultError as exc:
+            ctx.say(f"warning: could not check for leftover fault processes: {exc}")
 
     if failed:
         return 1
@@ -647,6 +737,9 @@ def cmd_run(ctx, args):
     fault = ctx.catalogue[request.fault_id]
     warmup, hold, cooldown = validate_run_options(fault, args.warmup, args.hold, args.cooldown)
     fid = request.fault_id
+    if fault["default_duration_s"] is not None and args.duration is None:
+        # A self-ending fault must still be running when `clear` happens; otherwise the clear would be 'late'.
+        request.duration_s = min(hold + RUN_END_MARGIN_S, fault["max_duration_s"])
     ctx.say(f"run {fid}: warm-up {warmup} s, hold {hold} s, cool-down {cooldown} s (Ctrl+C clears the fault)")
 
     aborted = False
@@ -659,25 +752,28 @@ def cmd_run(ctx, args):
         sleep_phase(ctx, "hold", hold)
     except KeyboardInterrupt:
         aborted = True
-        ctx.say("interrupted: clearing the fault now")
+        ctx.say("interrupted: clearing the fault now (a second Ctrl+C is held back until the clear is recorded)")
     except (FaultError, ValidationError) as exc:
         failure = exc
     finally:
-        # The state file is the source of truth: it also covers an inject that was interrupted half way.
-        record = read_state(ctx.state_path).get(fid)
-        if record is not None:
-            if aborted:
-                emit(ctx, "aborted", record, ctx.now(), reason="interrupted by Ctrl+C")
-            try:
-                cleared = [do_clear(ctx, record)]
-                recovered_ok = finish_recovery(ctx, cleared)
-            except FaultError as exc:
-                ctx.say(f"error while clearing {fid}: {exc}")
-                recovered_ok = False
+        guard = InterruptGuard(ctx.say)
+        with guard:     # a second Ctrl+C must not stop the tool before clear and recovered are written
+            # The state file is the source of truth: it also covers an inject that was interrupted half way.
+            record = read_state(ctx.state_path).get(fid)
+            if record is not None:
+                if aborted:
+                    emit(ctx, "aborted", record, ctx.now(), reason="interrupted by Ctrl+C")
+                try:
+                    cleared = [do_clear(ctx, record)]
+                    recovered_ok = finish_recovery(ctx, cleared)
+                except FaultError as exc:
+                    ctx.say(f"error while clearing {fid}: {exc}")
+                    recovered_ok = False
+        interrupted_in_clear = guard.count > 0
 
     if failure is not None:
         raise failure
-    if aborted:
+    if aborted or interrupted_in_clear:
         return 130
     if not recovered_ok:
         return 1

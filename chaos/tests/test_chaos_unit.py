@@ -1,4 +1,4 @@
-"""Unit tests for the pure logic of the chaos tool (module M3).
+"""Unit tests for the chaos tool (module M3): pure logic, plus command sequences with a fake docker.
 
 Run from the repo root (host Python, standard library only):
     python -m unittest discover -s chaos/tests
@@ -7,9 +7,11 @@ No real docker call happens here. A few tests use a fake command runner to check
 command sequences of F10 and F13.
 """
 
+import base64
 import copy
 import json
 import re
+import signal
 import sys
 import tempfile
 import unittest
@@ -150,8 +152,16 @@ class ArgumentValidationTests(unittest.TestCase):
             self.validate("F10", param_items=["x=1"])
 
     def test_fault_not_built_yet_is_refused_with_the_planned_checkpoint(self):
-        with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP2"):
-            self.validate("F01")
+        with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP3"):
+            chaos.validate_request(self.cat, "F06", implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
+        with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP4"):
+            chaos.validate_request(self.cat, "F18", implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
+
+    def test_f01_and_f02_are_built_in_cp2(self):
+        self.assertEqual(sorted(faults.IMPLEMENTED), ["F01", "F02", "F10", "F13"])
+        request = chaos.validate_request(self.cat, "F01", param_items=["processes=3"],
+                                         implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
+        self.assertEqual((request.target, request.duration_s, request.params), ("orders", 180, {"processes": 3}))
 
     def test_f06_f08_allow_three_targets_only(self):
         self.assertEqual(self.cat["F06"]["allowed_targets"], ["orders", "payments", "inventory"])
@@ -314,7 +324,16 @@ class StaleDecisionTests(unittest.TestCase):
         self.assertEqual(chaos.fault_status(record, {"postgres"}), "active")
 
     def test_unknown_fault_is_never_called_stale(self):
-        self.assertFalse(faults.effect_gone("F01", "orders", {"orders"}))
+        self.assertFalse(faults.effect_gone("F06", "inventory", {"inventory"}))
+
+    def test_process_faults_follow_the_marker_process_count(self):
+        running = {"orders", "payments"}
+        self.assertFalse(faults.effect_gone("F01", "orders", running, {"F01": 2}))
+        self.assertTrue(faults.effect_gone("F01", "orders", running, {"F01": 0}))
+        self.assertTrue(faults.effect_gone("F02", "payments", running, {"F02": 0}))
+        self.assertTrue(faults.effect_gone("F01", "orders", {"payments"}, {}))      # container not running
+        self.assertFalse(faults.effect_gone("F01", "orders", running, {}))          # could not count: unknown
+        self.assertFalse(faults.effect_gone("F01", "orders", running, None))
 
 
 # ---------------------------------------------------------------------------
@@ -344,21 +363,62 @@ class ComposePsTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 class FakeStack:
-    """Pretends to be docker: remembers which services are stopped and records every command."""
+    """Pretends to be docker: remembers stopped services, marker processes and files; records every command."""
 
     def __init__(self):
         self.stopped = set()
         self.commands = []
+        self.procs = {}              # service -> number of fault processes running inside
+        self.files = set()           # (service, path)
+        self.started = []            # (program, arguments) of every detached `exec -d`
+        self.on_start = None         # callback(service) after `docker compose start <service>`
+        self.exec_fails = False
+        self.memory_limit = 268435456
+        self.f02_state = "growing"
+
+    def _exec(self, args):
+        service = args[args.index("-T") + 1]
+        if self.exec_fails or service in self.stopped:
+            return faults.CmdResult(1, "", f'service "{service}" is not running')
+        at = args.index("-c")
+        code = base64.b64decode(args[at + 2]).decode()
+        extra = args[at + 3:]
+        if "-d" in args:
+            self.procs[service] = self.procs.get(service, 0) + 1
+            self.started.append((code, extra))
+            return faults.CmdResult(0, "", "")
+        if code == faults.PY_SCAN:
+            return faults.CmdResult(0, f"{self.procs.get(service, 0)}\n", "")
+        if code == faults.PY_TOUCH:
+            self.files.add((service, extra[0]))
+            self.procs[service] = 0                      # the processes see the stop file and end
+        elif code == faults.PY_REMOVE:
+            for path in extra:
+                self.files.discard((service, path))
+        elif code == faults.PY_READ:
+            if self.procs.get(service, 0):
+                return faults.CmdResult(0, json.dumps({"state": self.f02_state, "held_mib": 8}) + "\n", "")
+            return faults.CmdResult(0, "\n", "")
+        return faults.CmdResult(0, "", "")
 
     def runner(self, args, timeout):
         self.commands.append(list(args))
+        if args[:2] == ["docker", "inspect"]:
+            return faults.CmdResult(0, f"{self.memory_limit}\n", "")
+        if "exec" in args:
+            return self._exec(args)
+        if "ps" in args and "-q" in args:
+            return faults.CmdResult(0, "abc123def456\n", "")
         if "ps" in args:
             rows = [row(n, "exited", "") if n in self.stopped else row(n) for n in faults.M1_SERVICES]
             return faults.CmdResult(0, "\n".join(json.dumps(r) for r in rows), "")
         if "stop" in args:
             self.stopped.add(args[-1])
+            self.procs[args[-1]] = 0                     # processes die with the container
         elif "start" in args:
             self.stopped.discard(args[-1])
+            if self.on_start:
+                self.on_start(args[-1])
         return faults.CmdResult(0, "", "")
 
     def docker(self):
@@ -463,6 +523,7 @@ class EndToEndWithFakeDockerTests(unittest.TestCase):
             self.assertEqual(len({e["run_id"] for e in events}), 1)
             self.assertTrue(events[0]["ts"] <= events[1]["ts"] <= events[2]["ts"])
             self.assertIn("recovery_s", events[2])
+            self.assertTrue(all("late" not in e for e in events))        # a normal clear is not late
 
     def test_stale_record_is_reported_and_cleared(self):
         stack = FakeStack()
@@ -474,7 +535,11 @@ class EndToEndWithFakeDockerTests(unittest.TestCase):
             self.assertTrue(any("stale" in line for line in lines))
             self.assertEqual(chaos.main(["inject", "F13"], ctx), 2)      # stale record blocks a new inject
             self.assertEqual(chaos.main(["clear", "F13"], ctx), 0)
-            self.assertEqual([e["event"] for e in self.events(tmp)], ["inject", "clear", "recovered"])
+            events = self.events(tmp)
+            self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+            self.assertNotIn("late", events[0])
+            self.assertIs(events[1]["late"], True)                       # the effect was already gone
+            self.assertIs(events[2]["late"], True)
 
     def test_status_with_nothing_active(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -488,7 +553,8 @@ class EndToEndWithFakeDockerTests(unittest.TestCase):
             ctx, _ = self.make_ctx(tmp, stack)
             for argv in (["inject", "F99"], ["inject", "F10", "--target", "redis"],
                          ["inject", "F10", "--duration", "9999"], ["inject", "F01", "--duration", "9999"],
-                         ["inject", "F01"], ["clear"], ["clear", "F10", "--all"]):
+                         ["inject", "F06"], ["inject", "F01", "--param", "processes=9"],
+                         ["inject", "F02", "--param", "step_mib=0"], ["clear"], ["clear", "F10", "--all"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(chaos.main(argv, ctx), 2)
             self.assertFalse((Path(tmp) / "truth.jsonl").exists())
@@ -557,6 +623,336 @@ class ListTests(unittest.TestCase):
         for fid in EXPECTED_IDS:
             self.assertTrue(any(line.startswith(fid) for line in table[2:]), fid)
         self.assertTrue(re.search(r"F10 .*yes", table[2 + EXPECTED_IDS.index("F10")]))
+
+
+class MaskingForGroundTruthTests(unittest.TestCase):
+    """The ground-truth file masks password PATTERNS only, never plain words (CP2 request 1)."""
+
+    def test_pattern_mask_does_not_touch_plain_words(self):
+        self.assertEqual(chaos.mask_patterns("target postgres"), "target postgres")
+        self.assertEqual(chaos.mask_patterns("postgresql://shop:abc123@postgres/shop"),
+                         "postgresql://shop:***@postgres/shop")
+        self.assertEqual(chaos.mask_patterns("POSTGRES_PASSWORD=abc"), "POSTGRES_PASSWORD=***")
+
+    def test_value_mask_for_printed_output_still_replaces_the_word(self):
+        self.assertEqual(chaos.mask_secrets("docker compose stop postgres", ["postgres"]),
+                         "docker compose stop ***")
+
+    def test_default_ground_truth_mask_keeps_a_secret_word_and_valid_json(self):
+        cat = catalogue_dict()
+        record = {"run_id": "F10-abcd1234", "fault_id": "F10", "target": "postgres",
+                  "params": {"note": "POSTGRES_PASSWORD=abc and postgresql://u:pw123@postgres/db"}}
+        event = chaos.make_event("inject", record, cat["F10"], "2026-10-11T10:00:00.000Z")
+        parsed = json.loads(chaos.format_ground_truth_line(event))
+        self.assertEqual(parsed["target"], "postgres")
+        self.assertEqual(parsed["expected_root_cause"]["service"], "postgres")
+        self.assertNotIn("abc and", parsed["params"]["note"].replace("PASSWORD=***", ""))
+        self.assertNotIn("pw123", parsed["params"]["note"])
+
+    def test_mask_structure_handles_nested_values(self):
+        masked = chaos.mask_structure({"a": ["x1", {"b": "x1"}], "n": 5, "k": None}, lambda t: t.replace("x1", "#"))
+        self.assertEqual(masked, {"a": ["#", {"b": "#"}], "n": 5, "k": None})
+
+    def test_ground_truth_keeps_target_even_when_the_secret_is_the_word_postgres(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = chaos.Context(catalogue=chaos.load_catalogue(), dk=FakeStack().docker(), say=lambda _m: None,
+                                sleep=lambda _s: None, state_path=Path(tmp) / "active.json",
+                                truth_path=Path(tmp) / "truth.jsonl")
+            ctx.mask = lambda text: chaos.mask_secrets(text, ["postgres"])       # printed output masks the word
+            self.assertEqual(chaos.main(["inject", "F10"], ctx), 0)
+            self.assertEqual(chaos.main(["clear", "F10"], ctx), 0)
+            events = [json.loads(line) for line in (Path(tmp) / "truth.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(events), 3)
+            for event in events:
+                self.assertEqual(event["target"], "postgres")
+                self.assertEqual(event["expected_root_cause"]["service"], "postgres")
+
+
+class ProcessHelperTests(unittest.TestCase):
+    def test_python_command_has_no_quotes_or_newlines_and_round_trips(self):
+        cmd = faults.python_command(faults.F01_CODE, "/tmp/x.stop", 180, "chaos-F01-proc")
+        self.assertEqual(cmd[:3], ["python", "-c", faults.PY_WRAPPER])
+        self.assertEqual(base64.b64decode(cmd[3]).decode(), faults.F01_CODE)
+        self.assertEqual(cmd[4:], ["/tmp/x.stop", "180", "chaos-F01-proc"])
+        self.assertTrue(all("\n" not in part and '"' not in part for part in cmd))
+
+    def test_display_command_shortens_long_arguments_only(self):
+        shown = faults.display_command(["docker", "compose", "exec", "x" * 500, "orders"])
+        self.assertLess(len(shown), 100)
+        self.assertIn("(500 chars)", shown)
+        self.assertEqual(faults.display_command(["docker", "compose", "stop", "postgres"]),
+                         "docker compose stop postgres")
+
+    def test_the_inner_programs_are_valid_python(self):
+        for name in ("PY_SCAN", "PY_TOUCH", "PY_REMOVE", "PY_READ", "F01_CODE", "F02_CODE"):
+            compile(getattr(faults, name), name, "exec")
+
+    def test_process_fault_markers_are_distinct_and_not_part_of_the_stop_file_path(self):
+        for spec in faults.PROCESS_FAULTS.values():
+            self.assertNotIn(spec.marker, spec.stop_file)
+            self.assertNotIn(spec.marker, spec.status_file)
+        self.assertNotEqual(faults.PROCESS_FAULTS["F01"].marker, faults.PROCESS_FAULTS["F02"].marker)
+
+
+class ProcessFaultCommandTests(unittest.TestCase):
+    def test_f01_inject_starts_n_detached_processes_with_marker_stop_file_and_duration(self):
+        stack = FakeStack()
+        faults.inject_f01(stack.docker(), {"target": "orders", "params": {"processes": 3}, "duration_s": 180})
+        self.assertEqual(stack.procs["orders"], 3)
+        self.assertEqual(len(stack.started), 3)
+        for code, extra in stack.started:
+            self.assertEqual(code, faults.F01_CODE)
+            self.assertEqual(extra, ["/tmp/chaos-F01.stop", "180", "chaos-F01-proc"])
+        detached = [c for c in stack.commands if "-d" in c]
+        self.assertEqual(len(detached), 3)
+
+    def test_f01_clear_creates_the_stop_file_waits_and_removes_files(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        faults.inject_f01(dk, {"target": "orders", "params": {"processes": 2}, "duration_s": 60})
+        faults.clear_f01(dk, {"target": "orders"})
+        self.assertEqual(stack.procs["orders"], 0)
+        self.assertEqual(stack.files, set())                       # stop file and status file removed again
+
+    def test_f01_inject_refuses_when_processes_are_left_over(self):
+        stack = FakeStack()
+        stack.procs["orders"] = 1
+        with self.assertRaisesRegex(faults.FaultError, "already running"):
+            faults.inject_f01(stack.docker(), {"target": "orders", "params": {"processes": 2}, "duration_s": 60})
+        self.assertEqual(stack.started, [])
+
+    def test_f01_inject_reports_when_exec_is_not_possible(self):
+        stack = FakeStack()
+        stack.exec_fails = True
+        with self.assertRaisesRegex(faults.FaultError, "(?s)docker compose exec.*Stop here"):
+            faults.inject_f01(stack.docker(), {"target": "orders", "params": {"processes": 2}, "duration_s": 60})
+
+    def test_f01_clear_when_the_container_is_not_running_is_a_no_op(self):
+        stack = FakeStack()
+        stack.stopped.add("orders")
+        messages = []
+        dk = stack.docker()
+        dk.echo = messages.append
+        faults.clear_f01(dk, {"target": "orders"})
+        self.assertTrue(any("not running" in m for m in messages))
+        self.assertFalse(any("exec" in c for c in stack.commands))
+
+    def test_f01_clear_times_out_with_clear_text_when_processes_do_not_end(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        faults.inject_f01(dk, {"target": "orders", "params": {"processes": 1}, "duration_s": 60})
+        original = stack._exec
+
+        def stubborn(args):
+            result = original(args)
+            stack.procs["orders"] = 1                              # the process ignores the stop file
+            return result
+        stack._exec = stubborn
+        with self.assertRaisesRegex(faults.FaultError, "timeout after 30 s.*still running"):
+            faults.clear_f01(dk, {"target": "orders"})
+
+    def test_f02_ceiling_is_90_percent_of_the_limit_read_with_docker_inspect(self):
+        stack = FakeStack()
+        faults.inject_f02(stack.docker(), {"target": "payments", "duration_s": 240,
+                                           "params": {"step_mib": 8, "interval_s": 2}})
+        code, extra = stack.started[0]
+        self.assertEqual(code, faults.F02_CODE)
+        self.assertEqual(extra, ["/tmp/chaos-F02.stop", "240", "8", "2", str(int(268435456 * 0.9)),
+                                 "/tmp/chaos-F02.status.json", "chaos-F02-proc"])
+        self.assertTrue(any(c[:2] == ["docker", "inspect"] and "{{.HostConfig.Memory}}" in c for c in stack.commands))
+        self.assertTrue(any(c[-2:] == ["-q", "payments"] for c in stack.commands))
+
+    def test_f02_refuses_a_container_without_memory_limit(self):
+        stack = FakeStack()
+        stack.memory_limit = 0
+        with self.assertRaisesRegex(faults.FaultError, "no memory limit"):
+            faults.inject_f02(stack.docker(), {"target": "payments", "duration_s": 60,
+                                               "params": {"step_mib": 8, "interval_s": 2}})
+        self.assertEqual(stack.started, [])
+
+    def test_f02_reports_an_allocator_error(self):
+        stack = FakeStack()
+        stack.f02_state = "error_no_cgroup"
+        with self.assertRaisesRegex(faults.FaultError, "error_no_cgroup"):
+            faults.inject_f02(stack.docker(), {"target": "payments", "duration_s": 60,
+                                               "params": {"step_mib": 8, "interval_s": 2}})
+
+    def test_f02_clear(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        faults.inject_f02(dk, {"target": "payments", "duration_s": 60, "params": {"step_mib": 8, "interval_s": 2}})
+        faults.clear_f02(dk, {"target": "payments"})
+        self.assertEqual(stack.procs["payments"], 0)
+        self.assertEqual(stack.files, set())
+
+    def test_process_counts_skips_unreadable_and_stopped_containers(self):
+        stack = FakeStack()
+        stack.procs["orders"] = 2
+        dk = stack.docker()
+        records = [{"fault_id": "F01", "target": "orders"}, {"fault_id": "F10", "target": "postgres"}]
+        self.assertEqual(faults.process_counts(dk, records, {"orders", "postgres"}), {"F01": 2})
+        self.assertEqual(faults.process_counts(dk, records, set()), {})
+        stack.exec_fails = True
+        self.assertEqual(faults.process_counts(dk, records, {"orders"}), {})
+
+    def test_sweep_ends_leftover_processes_without_a_record(self):
+        stack = FakeStack()
+        stack.procs["orders"] = 2
+        ended = faults.sweep_process_faults(stack.docker(), {"F01": ["orders"], "F02": ["payments"]})
+        self.assertEqual(ended, [("F01", "orders")])
+        self.assertEqual(stack.procs["orders"], 0)
+
+
+class ProcessFaultFlowTests(unittest.TestCase):
+    def make_ctx(self, tmp, stack):
+        lines = []
+        ctx = chaos.Context(catalogue=chaos.load_catalogue(), dk=stack.docker(), say=lines.append,
+                            now=chaos.now_iso, sleep=lambda _s: None,
+                            state_path=Path(tmp) / "active.json", truth_path=Path(tmp) / "truth.jsonl")
+        return ctx, lines
+
+    def events(self, tmp):
+        return [json.loads(line) for line in (Path(tmp) / "truth.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def test_f01_inject_status_clear(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lines = self.make_ctx(tmp, stack)
+            self.assertEqual(chaos.main(["inject", "F01", "--duration", "90"], ctx), 0)
+            self.assertEqual(stack.started[0][1][1], "90")
+            self.assertEqual(chaos.main(["status"], ctx), 0)
+            self.assertTrue(any(" active" in line for line in lines))
+            self.assertEqual(chaos.main(["inject", "F01"], ctx), 2)           # same fault twice is refused
+            self.assertEqual(chaos.main(["clear", "F01"], ctx), 0)
+            events = self.events(tmp)
+            self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+            self.assertEqual(events[0]["expected_root_cause"], {"service": "orders", "type": "cpu_exhaustion"})
+            self.assertEqual(events[0]["acceptable_actions"], ["restart_service", "scale_service"])
+            self.assertTrue(all("late" not in e for e in events))
+
+    def test_f01_whose_duration_is_over_is_stale_and_its_clear_is_late(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lines = self.make_ctx(tmp, stack)
+            chaos.main(["inject", "F01"], ctx)
+            stack.procs["orders"] = 0                                         # the timer ended the processes
+            chaos.main(["status"], ctx)
+            self.assertTrue(any("stale" in line for line in lines))
+            self.assertEqual(chaos.main(["inject", "F01"], ctx), 2)           # stale record blocks a new inject
+            self.assertEqual(chaos.main(["clear", "F01"], ctx), 0)
+            events = self.events(tmp)
+            self.assertIs(events[1]["late"], True)
+            self.assertIs(events[2]["late"], True)
+
+    def test_f02_params_and_ground_truth(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, _ = self.make_ctx(tmp, stack)
+            self.assertEqual(chaos.main(["inject", "F02", "--param", "step_mib=4", "--param", "interval_s=1"], ctx), 0)
+            self.assertEqual(stack.started[0][1][2:4], ["4", "1"])
+            self.assertEqual(chaos.main(["clear", "F02"], ctx), 0)
+            events = self.events(tmp)
+            self.assertEqual(events[0]["params"], {"step_mib": 4, "interval_s": 1})
+            self.assertEqual(events[0]["expected_root_cause"], {"service": "payments", "type": "memory_exhaustion"})
+
+    def test_run_of_a_self_ending_fault_outlasts_the_hold_so_the_clear_is_not_late(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, _ = self.make_ctx(tmp, stack)
+            self.assertEqual(chaos.main(["run", "F01", "--warmup", "1", "--hold", "20", "--cooldown", "1"], ctx), 0)
+            self.assertEqual(stack.started[0][1][1], str(20 + chaos.RUN_END_MARGIN_S))
+            events = self.events(tmp)
+            self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+            self.assertTrue(all("late" not in e for e in events))
+
+    def test_run_duration_is_capped_at_max_duration(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, _ = self.make_ctx(tmp, stack)
+            chaos.main(["run", "F01", "--warmup", "0", "--hold", "590", "--cooldown", "0"], ctx)
+            self.assertEqual(stack.started[0][1][1], "600")
+
+    def test_clear_all_ends_leftover_processes_without_a_record(self):
+        stack = FakeStack()
+        stack.procs["payments"] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lines = self.make_ctx(tmp, stack)
+            self.assertEqual(chaos.main(["clear", "--all"], ctx), 0)
+            self.assertEqual(stack.procs["payments"], 0)
+            self.assertTrue(any("leftover F02" in line for line in lines))
+
+    def test_inject_failure_is_undone_and_nothing_is_recorded(self):
+        stack = FakeStack()
+        stack.memory_limit = 0                                                # F02 inject fails
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, _ = self.make_ctx(tmp, stack)
+            self.assertEqual(chaos.main(["inject", "F02"], ctx), 1)
+            self.assertEqual(chaos.read_state(ctx.state_path), {})
+            self.assertFalse((Path(tmp) / "truth.jsonl").exists())
+
+
+class SecondCtrlCTests(unittest.TestCase):
+    """CP2 request 3: Ctrl+C while the fault is being cleared must not stop the tool before the events are written."""
+
+    def make_ctx(self, tmp, stack):
+        lines = []
+        ctx = chaos.Context(catalogue=chaos.load_catalogue(), dk=stack.docker(), say=lines.append,
+                            now=chaos.now_iso, sleep=lambda _s: None,
+                            state_path=Path(tmp) / "active.json", truth_path=Path(tmp) / "truth.jsonl")
+        return ctx, lines
+
+    def events(self, tmp):
+        return [json.loads(line) for line in (Path(tmp) / "truth.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    @staticmethod
+    def interrupt_once():
+        fired = {"n": 0}
+
+        def callback(_service):
+            if fired["n"] == 0:
+                fired["n"] += 1
+                signal.raise_signal(signal.SIGINT)          # a Ctrl+C that arrives while the clear is running
+        return callback
+
+    def test_second_ctrl_c_during_the_clear_is_held_back(self):
+        stack = FakeStack()
+        before = signal.getsignal(signal.SIGINT)
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, lines = self.make_ctx(tmp, stack)
+            calls = {"n": 0}
+
+            def sleep(_seconds):
+                calls["n"] += 1
+                if calls["n"] == 2:                          # warm-up is the 1st sleep, hold the 2nd
+                    raise KeyboardInterrupt                  # first Ctrl+C
+            ctx.sleep = sleep
+            stack.on_start = self.interrupt_once()           # second Ctrl+C, during `docker compose start`
+            code = chaos.main(["run", "F13", "--warmup", "1", "--hold", "5", "--cooldown", "1"], ctx)
+            self.assertEqual(code, 130)
+            self.assertEqual([e["event"] for e in self.events(tmp)], ["inject", "aborted", "clear", "recovered"])
+            self.assertEqual(chaos.read_state(ctx.state_path), {})
+            self.assertEqual(stack.stopped, set())
+            self.assertTrue(any("Ctrl+C received while clearing" in line for line in lines))
+        self.assertIs(signal.getsignal(signal.SIGINT), before)      # the normal handler is back
+
+    def test_ctrl_c_only_during_the_clear_still_records_everything_and_exits_130(self):
+        stack = FakeStack()
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx, _ = self.make_ctx(tmp, stack)
+            stack.on_start = self.interrupt_once()
+            code = chaos.main(["run", "F13", "--warmup", "1", "--hold", "1", "--cooldown", "1"], ctx)
+            self.assertEqual(code, 130)
+            self.assertEqual([e["event"] for e in self.events(tmp)], ["inject", "clear", "recovered"])   # no 'aborted'
+            self.assertEqual(stack.stopped, set())
+
+    def test_the_guard_counts_and_restores_the_handler(self):
+        before = signal.getsignal(signal.SIGINT)
+        guard = chaos.InterruptGuard(lambda _m: None)
+        with guard:
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
+        self.assertEqual(guard.count, 2)
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
 
 
 if __name__ == "__main__":
