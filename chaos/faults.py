@@ -5,7 +5,9 @@ Built so far:
   F13  Redis down        (docker compose stop redis)                           CP1
   F01  CPU saturation    (busy-loop python processes inside orders)            CP2
   F02  Memory growth     (allocator python process inside payments)            CP2
-The other four faults of the catalogue are added in CP3 and CP4.
+  F06  Missing variable  (service recreated without DATABASE_URL: crash loop)  CP3
+  F08  Wrong credential  (service recreated with a wrong DATABASE_URL password) CP3
+The other two faults of the catalogue (F11, F18) are added in CP4.
 
 Design decisions (explain these in the viva):
   * Standard library only (decision D44). Every docker call is `subprocess` with an
@@ -26,6 +28,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -105,11 +108,14 @@ class Docker:
         self.http = http
         self.repo_root = Path(repo_root)
 
-    def compose_base(self):
+    def compose_base(self, extra_files=()):
+        """docker compose -f <base> -f <override> [-f <fault file> ...]: always explicit -f flags, never -p."""
         cmd = ["docker", "compose"]
         for name in BASE_COMPOSE_FILES:
             if (self.repo_root / name).exists():
                 cmd += ["-f", name]
+        for name in extra_files:
+            cmd += ["-f", name]
         return cmd
 
     def _run(self, cmd, timeout, show):
@@ -126,9 +132,10 @@ class Docker:
             raise FaultError(f"command failed with exit code {result.returncode}: {shown}\n{detail}{hint}")
         return result
 
-    def compose(self, *args, timeout=DOCKER_TIMEOUT_S, show=True):
-        """Run `docker compose <args>`. Raises FaultError on a non-zero exit code."""
-        return self._run(self.compose_base() + [str(a) for a in args], timeout, show)
+    def compose(self, *args, timeout=DOCKER_TIMEOUT_S, show=True, files=()):
+        """Run `docker compose <args>`. `files` are extra -f files (a generated fault file).
+        Raises FaultError on a non-zero exit code."""
+        return self._run(self.compose_base(files) + [str(a) for a in args], timeout, show)
 
     def docker(self, *args, timeout=DOCKER_TIMEOUT_S, show=True):
         """Run plain `docker <args>` (used only to read `docker inspect` of a compose container)."""
@@ -214,7 +221,7 @@ def running_services(states):
     return {name for name, (state, _health) in states.items() if state == "running"}
 
 
-def effect_gone(fault_id, target, running, process_counts=None):
+def effect_gone(fault_id, target, running, process_counts=None, config_states=None):
     """Stale-state decision: True when the effect of an active fault is no longer there.
 
     F10 and F13 stop a container, so the effect is gone as soon as that container runs again
@@ -223,9 +230,16 @@ def effect_gone(fault_id, target, running, process_counts=None):
     running, or when no process with the fault's marker is left (duration over, or container restarted).
     process_counts is {fault_id: number of marker processes}; a missing entry means "could not be
     counted", which is NOT reported as stale. A fault that is not known here is not reported as stale.
+    F06 and F08 change the environment of a recreated container, so the effect is gone when the
+    container no longer has the faulted environment: it was recreated from the base files (by hand, by
+    `clear`, by M8) or it does not exist any more. config_states is {fault_id: "faulted" | "clean" |
+    "missing"}; a missing entry means "could not be read" and is NOT reported as stale. Restarting the
+    container keeps its environment, so a restart alone does not make F06/F08 stale.
     """
     if fault_id in ("F10", "F13"):
         return target in running
+    if fault_id in CONFIG_FAULTS:
+        return (config_states or {}).get(fault_id) in ("clean", "missing")
     if fault_id in PROCESS_FAULTS:
         if target not in running:
             return True
@@ -571,13 +585,234 @@ def clear_f02(dk, record):
     _stop_process_fault(dk, record["target"], PROCESS_FAULTS["F02"])
 
 
+# ---------------------------------------------------------------------------
+# F06 and F08: recreate a service with a generated compose override file
+# ---------------------------------------------------------------------------
+# How it works, in short:
+#   * inject writes chaos/overrides/<fault>-<service>.yml (git-ignored) that changes ONLY the
+#     DATABASE_URL of the target service, then recreates that one service with explicit -f flags:
+#     docker-compose.yml, docker-compose.override.yml, <fault file>. No -p flag: the project name
+#     comes from `name: sentinelops` in docker-compose.yml.
+#   * the base file already has `restart: unless-stopped` for the three services, so no restart
+#     policy is added: a failing service is restarted by Docker with a growing delay (crash loop).
+#   * the effect is verified before it is applied (docker compose config) and after (docker inspect of
+#     the new container). The variable values are parsed in memory and NEVER printed.
+#   * clear recreates the service from the base files only (never a plain restart) and deletes the file.
+
+CONFIG_FAULTS = ("F06", "F08")
+WRONG_PASSWORD = "chaos-wrong-password-F08"     # a made-up string, not a secret; the real password is never changed
+OVERRIDE_DIR = Path("chaos") / "overrides"
+CRASH_LOOP_MIN_RESTARTS = 2
+CRASH_LOOP_TIMEOUT_S = 60
+RECREATE_TIMEOUT_S = 180
+
+
+def override_relpath(fault_id, target):
+    """Path of the generated fault file, relative to the repo root (forward slashes work in compose on Windows)."""
+    return (OVERRIDE_DIR / f"{fault_id}-{target}.yml").as_posix()
+
+
+def override_text(fault_id, target):
+    """Content of the generated fault file. Only the DATABASE_URL of one service is touched."""
+    if fault_id == "F06":
+        value = "!reset null"      # compose v5: removes the variable from the merged config (verified below)
+    elif fault_id == "F08":
+        value = '"postgresql://${POSTGRES_USER:-shop}:' + WRONG_PASSWORD + '@postgres:5432/${POSTGRES_DB:-shop}"'
+    else:
+        raise ValueError(f"{fault_id} has no override file")
+    return (f"# Generated by chaos/chaos.py for fault {fault_id} (target {target}). Git-ignored; removed by 'clear'.\n"
+            f"services:\n  {target}:\n    environment:\n      DATABASE_URL: {value}\n")
+
+
+def write_override(dk, fault_id, target):
+    path = dk.repo_root / override_relpath(fault_id, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(override_text(fault_id, target), encoding="utf-8", newline="\n")
+    return override_relpath(fault_id, target)
+
+
+def remove_generated_overrides(dk):
+    folder = dk.repo_root / OVERRIDE_DIR
+    if folder.is_dir():
+        for path in folder.glob("F0[68]-*.yml"):
+            path.unlink()
+
+
+def database_url_from_env(env):
+    """env is the list of 'KEY=VALUE' strings of a container. The DATABASE_URL value, or None when absent."""
+    for item in env:
+        if item.startswith("DATABASE_URL="):
+            return item[len("DATABASE_URL="):]
+    return None
+
+
+def check_f06_rendered(environment):
+    """The rendered config of the target must NOT contain DATABASE_URL at all (an empty value does not count)."""
+    if "DATABASE_URL" in environment:
+        raise FaultError("the fault file did not remove DATABASE_URL: it is still present in the rendered "
+                         "compose config of the service (value not shown). The '!reset' tag does not work as "
+                         "expected here. Stop and report this; do not work around it.")
+
+
+def check_f08_rendered(base_url, fault_url):
+    """The faulted URL may differ from the base URL in the password only. Values are never put in messages."""
+    if base_url is None or fault_url is None:
+        raise FaultError("DATABASE_URL is missing from the rendered compose config (value not shown)")
+    base, fault = urlsplit(base_url), urlsplit(fault_url)
+    if (base.username, base.hostname, base.port, base.path) != (fault.username, fault.hostname, fault.port, fault.path):
+        raise FaultError("the faulted DATABASE_URL differs from the base one in more than the password")
+    if fault.password != WRONG_PASSWORD:
+        raise FaultError("the faulted DATABASE_URL does not contain the wrong password")
+    if base.password == WRONG_PASSWORD:
+        raise FaultError("the base DATABASE_URL already has the wrong password: the stack is not in its base state")
+
+
+def rendered_environment(dk, target, files=()):
+    """Environment of one service as compose would run it (docker compose config --format json), in memory only."""
+    out = dk.compose("config", "--format", "json", files=files).stdout
+    try:
+        environment = json.loads(out)["services"][target].get("environment") or {}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise FaultError(f"cannot read the rendered compose config of {target}")
+    if isinstance(environment, list):
+        environment = {item.split("=", 1)[0]: (item.split("=", 1)[1] if "=" in item else None) for item in environment}
+    return environment
+
+
+def container_id(dk, service):
+    """Id of the container of a service (running or not), or None when there is none."""
+    ids = dk.compose("ps", "-q", "--all", service, show=False).stdout.split()
+    return ids[0] if ids else None
+
+
+def container_env(dk, service):
+    """Environment list of the service container, or None when there is no container. Never printed."""
+    cid = container_id(dk, service)
+    if cid is None:
+        return None
+    out = dk.docker("inspect", "--format", "{{json .Config.Env}}", cid, show=False).stdout.strip()
+    try:
+        env = json.loads(out)
+    except ValueError:
+        raise FaultError(f"cannot read the environment of the {service} container")
+    return env if isinstance(env, list) else []
+
+
+def config_state(dk, fault_id, target):
+    """'faulted' | 'clean' | 'missing' for F06/F08, from the real environment of the container."""
+    env = container_env(dk, target)
+    if env is None:
+        return "missing"
+    url = database_url_from_env(env)
+    if fault_id == "F06":
+        return "faulted" if url is None else "clean"
+    return "faulted" if (url is not None and WRONG_PASSWORD in url) else "clean"
+
+
+def config_states(dk, records):
+    """{fault_id: state} for the F06/F08 records. A failed read is left out: unknown is never reported as stale."""
+    states = {}
+    for record in records:
+        if record["fault_id"] in CONFIG_FAULTS:
+            try:
+                states[record["fault_id"]] = config_state(dk, record["fault_id"], record["target"])
+            except FaultError:
+                pass
+    return states
+
+
+def _wait_crash_loop(dk, target):
+    def check():
+        cid = container_id(dk, target)
+        if cid is None:
+            return (False, f"no container for {target}")
+        out = dk.docker("inspect", "--format", "{{.RestartCount}} {{.State.Status}}", cid, show=False).stdout.split()
+        try:
+            restarts, status = int(out[0]), out[1]
+        except (ValueError, IndexError):
+            return (False, f"cannot read the restart count of {target}")
+        return (restarts >= CRASH_LOOP_MIN_RESTARTS, f"restart count {restarts}, status {status}")
+    wait_until(dk, check, f"{target} to start crash-looping", CRASH_LOOP_TIMEOUT_S)
+
+
+def _recreate_from_base(dk, target):
+    """Recreate (not just restart) one service from the base files only, then wait until it is healthy."""
+    dk.compose("up", "-d", "--no-deps", "--force-recreate", target, timeout=RECREATE_TIMEOUT_S)
+    wait_services_healthy(dk, [target])
+
+
+def inject_f06(dk, request):
+    """Missing environment variable: the service is recreated without DATABASE_URL and crash-loops."""
+    target = request["target"]
+    fault_file = write_override(dk, "F06", target)
+    check_f06_rendered(rendered_environment(dk, target, files=[fault_file]))
+    dk.echo(f"verified: DATABASE_URL is absent from the rendered config of {target}")
+    dk.compose("up", "-d", "--no-deps", "--force-recreate", target, files=[fault_file], timeout=RECREATE_TIMEOUT_S)
+    if config_state(dk, "F06", target) != "faulted":
+        raise FaultError(f"the new {target} container still has DATABASE_URL")
+    dk.echo(f"verified: DATABASE_URL is absent in the new {target} container")
+    _wait_crash_loop(dk, target)
+    dk.echo(f"verified: {target} is in a crash loop (restart count >= {CRASH_LOOP_MIN_RESTARTS})")
+
+
+def inject_f08(dk, request):
+    """Invalid credential: the service is recreated with a wrong DATABASE_URL password and keeps running."""
+    target = request["target"]
+    fault_file = write_override(dk, "F08", target)
+    base_url = rendered_environment(dk, target).get("DATABASE_URL")
+    fault_url = rendered_environment(dk, target, files=[fault_file]).get("DATABASE_URL")
+    check_f08_rendered(base_url, fault_url)
+    dk.echo(f"verified: the rendered DATABASE_URL of {target} differs from the base one only in the password")
+    dk.compose("up", "-d", "--no-deps", "--force-recreate", target, files=[fault_file], timeout=RECREATE_TIMEOUT_S)
+    wait_services_healthy(dk, [target])      # the health check is liveness only, so the service stays healthy
+    if config_state(dk, "F08", target) != "faulted":
+        raise FaultError(f"the new {target} container does not have the wrong password")
+    dk.echo(f"verified: {target} is running with the wrong database password")
+
+
+def clear_config_fault(dk, record):
+    """Clear F06/F08: recreate from the base files, wait until healthy, delete the generated file."""
+    _recreate_from_base(dk, record["target"])
+    (dk.repo_root / override_relpath(record["fault_id"], record["target"])).unlink(missing_ok=True)
+
+
+def clear_f06(dk, record):
+    clear_config_fault(dk, record)
+
+
+def clear_f08(dk, record):
+    clear_config_fault(dk, record)
+
+
+def sweep_config_faults(dk, targets):
+    """For `clear --all`: recreate every target whose container still has an F06/F08 environment.
+
+    This also works without a record (for example after active.json was deleted).
+    Returns [(fault_id, service)] that were recreated. The generated files are deleted at the end.
+    """
+    recreated = []
+    for target in targets:
+        env = container_env(dk, target)
+        if env is None:
+            continue
+        url = database_url_from_env(env)
+        kind = "F06" if url is None else ("F08" if WRONG_PASSWORD in url else None)
+        if kind:
+            _recreate_from_base(dk, target)
+            recreated.append((kind, target))
+    remove_generated_overrides(dk)
+    return recreated
+
+
 # fault id -> (inject function, clear function). A fault that is not in this table is not built yet.
 IMPLEMENTED = {
     "F01": (inject_f01, clear_f01),
     "F02": (inject_f02, clear_f02),
+    "F06": (inject_f06, clear_f06),
+    "F08": (inject_f08, clear_f08),
     "F10": (inject_f10, clear_f10),
     "F13": (inject_f13, clear_f13),
 }
 
 # Which checkpoint builds each missing fault (used in the "not built yet" message and in `list`).
-PLANNED = {"F06": "CP3", "F08": "CP3", "F11": "CP4", "F18": "CP4"}
+PLANNED = {"F11": "CP4", "F18": "CP4"}

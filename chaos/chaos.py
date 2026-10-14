@@ -441,10 +441,20 @@ def write_state(active, path=STATE_PATH):
     os.replace(temp, path)
 
 
-def fault_status(record, running, process_counts=None):
+def fault_status(record, running, process_counts=None, config_states=None):
     """'active' or 'stale' (the effect is gone although the record still exists)."""
-    gone = faults.effect_gone(record["fault_id"], record["target"], running, process_counts)
+    gone = faults.effect_gone(record["fault_id"], record["target"], running, process_counts, config_states)
     return "stale" if gone else "active"
+
+
+def observe(dk, records, states=None):
+    """What docker says about the recorded faults: (running services, F01/F02 process counts, F06/F08 states).
+
+    Everything that cannot be read is simply left out, and a missing value is never reported as stale.
+    """
+    states = states if states is not None else faults.service_states(dk.ps())
+    running = faults.running_services(states)
+    return running, faults.process_counts(dk, records, running), faults.config_states(dk, records)
 
 
 # ---------------------------------------------------------------------------
@@ -542,11 +552,10 @@ def cmd_list(ctx, _args):
 def effect_already_gone(ctx, record):
     """True when the effect of a recorded fault is already gone (a 'late' clear). Unknown counts as not gone."""
     try:
-        running = faults.running_services(faults.service_states(ctx.dk.ps()))
-        counts = faults.process_counts(ctx.dk, [record], running)
+        running, counts, configs = observe(ctx.dk, [record])
     except FaultError:
         return False
-    return fault_status(record, running, counts) == "stale"
+    return fault_status(record, running, counts, configs) == "stale"
 
 
 def cmd_status(ctx, _args):
@@ -555,20 +564,20 @@ def cmd_status(ctx, _args):
         ctx.say("no active faults")
         return 0
     try:
-        running = faults.running_services(faults.service_states(ctx.dk.ps()))
-        counts = faults.process_counts(ctx.dk, list(state.values()), running)
+        running, counts, configs = observe(ctx.dk, list(state.values()))
     except FaultError as exc:
         ctx.say(f"warning: cannot cross-check with docker ({exc}); showing the recorded state only")
         running = None
         counts = {}
+        configs = {}
     rows = []
     for fid, record in state.items():
         age = format_age((datetime.now(timezone.utc) - parse_iso(record["started_ts"])).total_seconds())
-        status = fault_status(record, running, counts) if running is not None else "unknown"
+        status = fault_status(record, running, counts, configs) if running is not None else "unknown"
         rows.append([fid, record["target"], record["run_id"], age, status])
     ctx.say(format_table(["ID", "Target", "Run id", "Age", "State"], rows))
     if any(row[4] == "stale" for row in rows):
-        ctx.say("stale = the effect is gone (container restarted, or the fault's duration is over). "
+        ctx.say("stale = the effect is gone (service recreated or restarted, or the fault's duration is over). "
                 "Remove the record with: python chaos/chaos.py clear <ID>")
     return 0
 
@@ -581,8 +590,8 @@ def do_inject(ctx, request, mode="inject"):
     states = faults.service_states(dk.ps())
     if fid in state:
         record = state[fid]
-        running = faults.running_services(states)
-        status = fault_status(record, running, faults.process_counts(dk, [record], running))
+        running, counts, configs = observe(dk, [record], states)
+        status = fault_status(record, running, counts, configs)
         if status == "stale":
             raise ValidationError(f"{fid} is recorded as active (run {record['run_id']}) but its effect is gone "
                                   f"(stale). Run first: python chaos/chaos.py clear {fid}")
@@ -702,6 +711,15 @@ def cmd_clear(ctx, args):
             ctx.say(f"error while clearing {record['fault_id']}: {exc}")
 
     if args.all:
+        try:
+            # F06/F08: a service that still has a faulted environment is recreated from the base files
+            targets = list(dict.fromkeys(t for fid in faults.CONFIG_FAULTS if fid in ctx.catalogue
+                                         for t in ctx.catalogue[fid]["allowed_targets"]))
+            for kind, target in faults.sweep_config_faults(ctx.dk, targets):
+                ctx.say(f"recreated {target} from the base files (it still had the {kind} fault)")
+        except FaultError as exc:
+            failed = True
+            ctx.say(f"error: {exc}")
         try:
             for name in faults.heal_stopped_services(ctx.dk):
                 ctx.say(f"started stopped container: {name}")

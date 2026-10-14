@@ -152,13 +152,12 @@ class ArgumentValidationTests(unittest.TestCase):
             self.validate("F10", param_items=["x=1"])
 
     def test_fault_not_built_yet_is_refused_with_the_planned_checkpoint(self):
-        with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP3"):
-            chaos.validate_request(self.cat, "F06", implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
-        with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP4"):
-            chaos.validate_request(self.cat, "F18", implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
+        for fid in ("F11", "F18"):
+            with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP4"):
+                chaos.validate_request(self.cat, fid, implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
 
-    def test_f01_and_f02_are_built_in_cp2(self):
-        self.assertEqual(sorted(faults.IMPLEMENTED), ["F01", "F02", "F10", "F13"])
+    def test_the_built_faults(self):
+        self.assertEqual(sorted(faults.IMPLEMENTED), ["F01", "F02", "F06", "F08", "F10", "F13"])
         request = chaos.validate_request(self.cat, "F01", param_items=["processes=3"],
                                          implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
         self.assertEqual((request.target, request.duration_s, request.params), ("orders", 180, {"processes": 3}))
@@ -324,7 +323,7 @@ class StaleDecisionTests(unittest.TestCase):
         self.assertEqual(chaos.fault_status(record, {"postgres"}), "active")
 
     def test_unknown_fault_is_never_called_stale(self):
-        self.assertFalse(faults.effect_gone("F06", "inventory", {"inventory"}))
+        self.assertFalse(faults.effect_gone("F11", "postgres", {"postgres"}))
 
     def test_process_faults_follow_the_marker_process_count(self):
         running = {"orders", "payments"}
@@ -362,8 +361,12 @@ class ComposePsTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+REAL_URL = "postgresql://shop:realpw-secret@postgres:5432/shop"       # the fake stack's "real" password
+
+
 class FakeStack:
-    """Pretends to be docker: remembers stopped services, marker processes and files; records every command."""
+    """Pretends to be docker: remembers stopped services, marker processes, files and container
+    environments; records every command. The F06/F08 fault files are really read from disk."""
 
     def __init__(self):
         self.stopped = set()
@@ -375,6 +378,40 @@ class FakeStack:
         self.exec_fails = False
         self.memory_limit = 268435456
         self.f02_state = "growing"
+        self.base_env = {name: ["PATH=/usr/bin", f"SERVICE_NAME={name}", "DATABASE_URL=" + REAL_URL]
+                         for name in ("orders", "payments", "inventory")}
+        self.env = {name: list(env) for name, env in self.base_env.items()}
+        self.removed = set()         # services without any container
+        self.crash = set()           # services in a crash loop
+        self.reset_works = True      # False: the '!reset' tag does not remove the variable
+        self.repo_root = CHAOS_DIR.parent
+
+    # -- helpers --------------------------------------------------------------------------------
+    def _service_of(self, cid):
+        return cid[len("cid-"):]
+
+    def _fault_env(self, service, files):
+        """Environment the service gets when compose merges the given -f files (only fault files matter here)."""
+        env = list(self.base_env.get(service, []))
+        for name in files:
+            if not name.startswith("chaos/overrides/"):
+                continue
+            target = name.rsplit("/", 1)[1][:-4].split("-", 1)[1]
+            if target != service:
+                continue
+            text = (Path(self.repo_root) / name).read_text(encoding="utf-8")
+            if "!reset" in text:
+                if self.reset_works:
+                    env = [e for e in env if not e.startswith("DATABASE_URL=")]
+            else:
+                value = re.search(r'DATABASE_URL: "(.*)"', text).group(1)
+                value = value.replace("${POSTGRES_USER:-shop}", "shop").replace("${POSTGRES_DB:-shop}", "shop")
+                env = [e for e in env if not e.startswith("DATABASE_URL=")] + ["DATABASE_URL=" + value]
+        return env
+
+    @staticmethod
+    def _files(args):
+        return [args[i + 1] for i, a in enumerate(args) if a == "-f"]
 
     def _exec(self, args):
         service = args[args.index("-T") + 1]
@@ -401,16 +438,57 @@ class FakeStack:
             return faults.CmdResult(0, "\n", "")
         return faults.CmdResult(0, "", "")
 
+    def _config(self, args):
+        files = self._files(args)
+        services = {name: {"environment": {e.split("=", 1)[0]: e.split("=", 1)[1] for e in self._fault_env(name, files)}}
+                    for name in self.base_env}
+        return faults.CmdResult(0, json.dumps({"name": "sentinelops", "services": services}), "")
+
+    def _up(self, args):
+        service = args[-1]
+        self.env[service] = self._fault_env(service, self._files(args))
+        self.removed.discard(service)
+        self.stopped.discard(service)
+        if faults.database_url_from_env(self.env[service]) is None:
+            self.crash.add(service)
+        else:
+            self.crash.discard(service)
+        return faults.CmdResult(0, "", "")
+
+    def _inspect(self, args):
+        fmt, cid = args[args.index("--format") + 1], args[-1]
+        service = self._service_of(cid)
+        if fmt == "{{json .Config.Env}}":
+            return faults.CmdResult(0, json.dumps(self.env.get(service, [])) + "\n", "")
+        if fmt == "{{.RestartCount}} {{.State.Status}}":
+            return faults.CmdResult(0, "3 restarting\n" if service in self.crash else "0 running\n", "")
+        return faults.CmdResult(0, f"{self.memory_limit}\n", "")
+
+    # -- the fake docker ------------------------------------------------------------------------
     def runner(self, args, timeout):
         self.commands.append(list(args))
         if args[:2] == ["docker", "inspect"]:
-            return faults.CmdResult(0, f"{self.memory_limit}\n", "")
+            return self._inspect(args)
         if "exec" in args:
             return self._exec(args)
+        if "config" in args:
+            return self._config(args)
+        if "up" in args:
+            return self._up(args)
         if "ps" in args and "-q" in args:
-            return faults.CmdResult(0, "abc123def456\n", "")
+            service = args[-1]
+            return faults.CmdResult(0, "" if service in self.removed else f"cid-{service}\n", "")
         if "ps" in args:
-            rows = [row(n, "exited", "") if n in self.stopped else row(n) for n in faults.M1_SERVICES]
+            rows = []
+            for name in faults.M1_SERVICES:
+                if name in self.removed:
+                    continue
+                if name in self.stopped:
+                    rows.append(row(name, "exited", ""))
+                elif name in self.crash:
+                    rows.append(row(name, "restarting", ""))
+                else:
+                    rows.append(row(name))
             return faults.CmdResult(0, "\n".join(json.dumps(r) for r in rows), "")
         if "stop" in args:
             self.stopped.add(args[-1])
@@ -421,10 +499,12 @@ class FakeStack:
                 self.on_start(args[-1])
         return faults.CmdResult(0, "", "")
 
-    def docker(self):
+    def docker(self, repo_root=None, echo=None):
+        self.repo_root = Path(repo_root) if repo_root else CHAOS_DIR.parent
         clock = {"t": 0.0}
-        return faults.Docker(runner=self.runner, echo=lambda _m: None, sleep=lambda s: clock.update(t=clock["t"] + s),
-                             monotonic=lambda: clock["t"], http=lambda _url: 200, repo_root=CHAOS_DIR.parent)
+        return faults.Docker(runner=self.runner, echo=echo or (lambda _m: None),
+                             sleep=lambda s: clock.update(t=clock["t"] + s),
+                             monotonic=lambda: clock["t"], http=lambda _url: 200, repo_root=self.repo_root)
 
 
 class FaultCommandTests(unittest.TestCase):
@@ -553,7 +633,7 @@ class EndToEndWithFakeDockerTests(unittest.TestCase):
             ctx, _ = self.make_ctx(tmp, stack)
             for argv in (["inject", "F99"], ["inject", "F10", "--target", "redis"],
                          ["inject", "F10", "--duration", "9999"], ["inject", "F01", "--duration", "9999"],
-                         ["inject", "F06"], ["inject", "F01", "--param", "processes=9"],
+                         ["inject", "F11"], ["inject", "F01", "--param", "processes=9"],
                          ["inject", "F02", "--param", "step_mib=0"], ["clear"], ["clear", "F10", "--all"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(chaos.main(argv, ctx), 2)
@@ -953,6 +1033,409 @@ class SecondCtrlCTests(unittest.TestCase):
             signal.raise_signal(signal.SIGINT)
         self.assertEqual(guard.count, 2)
         self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+
+class ConfigFaultPureTests(unittest.TestCase):
+    """F06/F08: generated override files, the checks on the rendered config, the stale decision."""
+
+    def test_override_relpath_uses_forward_slashes(self):
+        self.assertEqual(faults.override_relpath("F06", "inventory"), "chaos/overrides/F06-inventory.yml")
+
+    def test_f06_override_text_removes_only_database_url_of_the_target(self):
+        text = faults.override_text("F06", "inventory")
+        self.assertIn("services:\n  inventory:\n    environment:\n      DATABASE_URL: !reset null\n", text)
+        self.assertEqual(text.count("DATABASE_URL"), 1)
+        self.assertNotIn("restart", text)                     # the base file already has restart: unless-stopped
+        self.assertNotIn("\r", text)
+
+    def test_f08_override_text_has_the_wrong_password_and_no_real_secret(self):
+        text = faults.override_text("F08", "orders")
+        self.assertIn("  orders:\n    environment:\n      DATABASE_URL: ", text)
+        self.assertIn(":" + faults.WRONG_PASSWORD + "@postgres:5432/", text)
+        self.assertIn("${POSTGRES_USER:-shop}", text)
+        self.assertIn("${POSTGRES_DB:-shop}", text)
+        self.assertNotIn("POSTGRES_PASSWORD", text)
+
+    def test_override_text_for_other_faults_is_an_error(self):
+        with self.assertRaises(ValueError):
+            faults.override_text("F10", "postgres")
+
+    def test_database_url_from_env(self):
+        self.assertIsNone(faults.database_url_from_env(["A=1", "DATABASE_URL_OLD=x"]))
+        self.assertEqual(faults.database_url_from_env(["DATABASE_URL="]), "")
+        self.assertEqual(faults.database_url_from_env(["A=1", "DATABASE_URL=u"]), "u")
+
+    def test_f06_check_needs_the_variable_to_be_absent_not_empty(self):
+        faults.check_f06_rendered({"LOG_LEVEL": "INFO"})
+        for environment in ({"DATABASE_URL": REAL_URL}, {"DATABASE_URL": ""}, {"DATABASE_URL": None}):
+            with self.subTest(environment=environment):
+                with self.assertRaisesRegex(faults.FaultError, "did not remove DATABASE_URL") as ctx:
+                    faults.check_f06_rendered(environment)
+                self.assertNotIn("realpw-secret", str(ctx.exception))
+
+    def test_f08_check_accepts_a_password_only_change(self):
+        faults.check_f08_rendered(REAL_URL, REAL_URL.replace("realpw-secret", faults.WRONG_PASSWORD))
+
+    def test_f08_check_rejects_everything_else_without_printing_values(self):
+        wrong = REAL_URL.replace("realpw-secret", faults.WRONG_PASSWORD)
+        cases = [
+            (REAL_URL, REAL_URL, "wrong password"),                                     # nothing changed
+            (REAL_URL, wrong.replace("@postgres:", "@elsewhere:"), "more than the password"),
+            (REAL_URL, wrong.replace("shop:", "admin:", 1), "more than the password"),
+            (REAL_URL, wrong.replace("/shop", "/other"), "more than the password"),
+            (wrong, wrong, "not in its base state"),
+            (None, wrong, "missing"),
+            (REAL_URL, None, "missing"),
+        ]
+        for base, fault, word in cases:
+            with self.subTest(word=word):
+                with self.assertRaisesRegex(faults.FaultError, word) as ctx:
+                    faults.check_f08_rendered(base, fault)
+                self.assertNotIn("realpw-secret", str(ctx.exception))
+
+    def test_effect_gone_for_config_faults(self):
+        running = {"inventory"}
+        self.assertFalse(faults.effect_gone("F06", "inventory", running, None, {"F06": "faulted"}))
+        self.assertTrue(faults.effect_gone("F06", "inventory", running, None, {"F06": "clean"}))
+        self.assertTrue(faults.effect_gone("F08", "orders", running, None, {"F08": "missing"}))
+        self.assertFalse(faults.effect_gone("F08", "orders", running, None, {}))        # could not read: unknown
+        self.assertFalse(faults.effect_gone("F08", "orders", running, None, None))
+        self.assertFalse(faults.effect_gone("F06", "inventory", set(), None, {"F06": "faulted"}))   # a crash loop is not "stopped"
+
+    def test_config_state_from_the_container_environment(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        self.assertEqual(faults.config_state(dk, "F06", "inventory"), "clean")
+        self.assertEqual(faults.config_state(dk, "F08", "inventory"), "clean")
+        stack.env["inventory"] = [e for e in stack.env["inventory"] if not e.startswith("DATABASE_URL=")]
+        self.assertEqual(faults.config_state(dk, "F06", "inventory"), "faulted")
+        stack.env["orders"] = ["DATABASE_URL=postgresql://shop:" + faults.WRONG_PASSWORD + "@postgres:5432/shop"]
+        self.assertEqual(faults.config_state(dk, "F08", "orders"), "faulted")
+        stack.removed.add("payments")
+        self.assertEqual(faults.config_state(dk, "F06", "payments"), "missing")
+
+    def test_config_states_skips_unreadable_containers(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        original = dk.runner
+
+        def broken_inspect(args, timeout):
+            if args[:2] == ["docker", "inspect"]:
+                return faults.CmdResult(1, "", "boom")
+            return original(args, timeout)
+        dk.runner = broken_inspect
+        records = [{"fault_id": "F06", "target": "inventory"}, {"fault_id": "F10", "target": "postgres"}]
+        self.assertEqual(faults.config_states(dk, records), {})
+
+
+class ConfigFaultBase(unittest.TestCase):
+    """A fake repo folder (with the two compose files), the fake stack, and ONE ordered output log."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for name in faults.BASE_COMPOSE_FILES:
+            (self.repo / name).write_text("name: sentinelops\n", encoding="utf-8")
+        self.stack = FakeStack()
+        self.out = []                              # commands and messages, in the order the user would see them
+        self.ctx = chaos.Context(catalogue=chaos.load_catalogue(),
+                                 dk=self.stack.docker(repo_root=self.repo, echo=self.out.append),
+                                 say=self.out.append, sleep=lambda _s: None,
+                                 state_path=self.root / "active.json", truth_path=self.root / "truth.jsonl")
+
+    def cli(self, *argv):
+        return chaos.main(list(argv), self.ctx)
+
+    def events(self):
+        return [json.loads(line) for line in (self.root / "truth.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def shown(self):
+        """The printed output with run ids replaced, for exact comparisons."""
+        return [re.sub(r"F0[68]-[0-9a-f]{8}", "F0X-<id>", re.sub(r"recovered \d+\.\d s", "recovered <t> s", line))
+                for line in self.out]
+
+    def override_file(self, fault_id, target):
+        return self.repo / "chaos" / "overrides" / f"{fault_id}-{target}.yml"
+
+    def base_files(self):
+        return "-f docker-compose.yml -f docker-compose.override.yml"
+
+
+class ConfigFaultCommandTests(ConfigFaultBase):
+    def mutating(self):
+        return [c for c in self.stack.commands if "up" in c]
+
+    def test_f06_inject_prints_exactly_these_lines(self):
+        self.assertEqual(self.cli("inject", "F06"), 0)
+        fault_file = f"{self.base_files()} -f chaos/overrides/F06-inventory.yml"
+        self.assertEqual(self.shown(), [
+            f"+ docker compose {fault_file} config --format json",
+            "verified: DATABASE_URL is absent from the rendered config of inventory",
+            f"+ docker compose {fault_file} up -d --no-deps --force-recreate inventory",
+            "verified: DATABASE_URL is absent in the new inventory container",
+            "verified: inventory is in a crash loop (restart count >= 2)",
+            "injected F06 on inventory (run id F0X-<id>)",
+            "it stays until: python chaos/chaos.py clear F06",
+        ])
+        self.assertEqual(self.override_file("F06", "inventory").read_text(encoding="utf-8"),
+                         faults.override_text("F06", "inventory"))
+        self.assertIn("inventory", self.stack.crash)
+        self.assertEqual(self.stack.env["orders"], self.stack.base_env["orders"])      # other services untouched
+
+    def test_f06_clear_prints_exactly_these_lines_and_recreates_from_the_base_files(self):
+        self.cli("inject", "F06")
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "F06"), 0)
+        self.assertEqual(self.shown(), [
+            f"+ docker compose {self.base_files()} up -d --no-deps --force-recreate inventory",
+            "cleared F06 (run id F0X-<id>)",
+            "waiting for all 6 containers to be healthy and the gateway to answer 200 ...",
+            "F06: recovered <t> s after the clear",
+        ])
+        self.assertEqual(self.stack.env["inventory"], self.stack.base_env["inventory"])
+        self.assertNotIn("inventory", self.stack.crash)
+        self.assertFalse(self.override_file("F06", "inventory").exists())
+        last_up = self.mutating()[-1]
+        self.assertNotIn("chaos/overrides/F06-inventory.yml", last_up)               # base files only
+        self.assertIn("--force-recreate", last_up)                                    # recreate, not restart
+        self.assertFalse(any("restart" in c for c in self.stack.commands))
+
+    def test_f06_on_another_target_uses_its_own_file_name(self):
+        self.assertEqual(self.cli("inject", "F06", "--target", "payments"), 0)
+        self.assertTrue(self.override_file("F06", "payments").exists())
+        self.assertFalse(self.override_file("F06", "inventory").exists())
+        self.assertIn("payments", self.stack.crash)
+
+    def test_f06_is_refused_when_the_reset_tag_does_not_remove_the_variable(self):
+        self.stack.reset_works = False
+        self.assertEqual(self.cli("inject", "F06"), 1)
+        self.assertFalse(any("up" in c and "chaos/overrides/F06-inventory.yml" in c
+                             for c in self.stack.commands))                           # the fault was never applied
+        self.assertTrue(any("Stop and report" in line for line in self.out))
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+        self.assertFalse((self.root / "truth.jsonl").exists())
+        self.assertFalse(self.override_file("F06", "inventory").exists())              # rolled back
+
+    def test_f06_clear_works_when_the_generated_file_is_already_gone(self):
+        self.cli("inject", "F06")
+        self.override_file("F06", "inventory").unlink()
+        self.assertEqual(self.cli("status"), 0)
+        self.assertTrue(any(line.rstrip().endswith("active") for line in self.out))    # the container is still faulted
+        self.assertEqual(self.cli("clear", "F06"), 0)
+        events = self.events()
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(self.stack.env["inventory"], self.stack.base_env["inventory"])
+
+    def test_f08_inject_prints_exactly_these_lines(self):
+        self.assertEqual(self.cli("inject", "F08"), 0)
+        fault_file = f"{self.base_files()} -f chaos/overrides/F08-orders.yml"
+        self.assertEqual(self.shown(), [
+            f"+ docker compose {self.base_files()} config --format json",
+            f"+ docker compose {fault_file} config --format json",
+            "verified: the rendered DATABASE_URL of orders differs from the base one only in the password",
+            f"+ docker compose {fault_file} up -d --no-deps --force-recreate orders",
+            "verified: orders is running with the wrong database password",
+            "injected F08 on orders (run id F0X-<id>)",
+            "it stays until: python chaos/chaos.py clear F08",
+        ])
+        url = faults.database_url_from_env(self.stack.env["orders"])
+        self.assertIn(faults.WRONG_PASSWORD, url)
+        self.assertNotIn("orders", self.stack.crash)                                     # F08 does not crash the service
+        self.assertEqual(self.stack.env["payments"], self.stack.base_env["payments"])
+
+    def test_f08_clear_prints_exactly_these_lines(self):
+        self.cli("inject", "F08")
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "F08"), 0)
+        self.assertEqual(self.shown(), [
+            f"+ docker compose {self.base_files()} up -d --no-deps --force-recreate orders",
+            "cleared F08 (run id F0X-<id>)",
+            "waiting for all 6 containers to be healthy and the gateway to answer 200 ...",
+            "F08: recovered <t> s after the clear",
+        ])
+        self.assertEqual(self.stack.env["orders"], self.stack.base_env["orders"])
+        self.assertFalse(self.override_file("F08", "orders").exists())
+
+    def test_the_real_password_never_appears_anywhere(self):
+        self.cli("inject", "F08")
+        self.cli("status")
+        self.cli("clear", "F08")
+        self.cli("run", "F06", "--warmup", "0", "--hold", "1", "--cooldown", "0")
+        everything = "\n".join(self.out) + (self.root / "truth.jsonl").read_text(encoding="utf-8") \
+            + (self.root / "active.json").read_text(encoding="utf-8")
+        for path in (self.repo / "chaos" / "overrides").glob("*"):
+            everything += path.read_text(encoding="utf-8")
+        self.assertNotIn("realpw-secret", everything)
+        self.assertNotIn(REAL_URL, everything)
+
+    def test_commands_never_use_a_project_flag_and_always_list_the_base_files_first(self):
+        self.cli("inject", "F08")
+        self.cli("clear", "F08")
+        for cmd in self.stack.commands:
+            if cmd[:2] == ["docker", "compose"]:
+                self.assertNotIn("-p", cmd)
+                self.assertEqual(cmd[2:6], ["-f", "docker-compose.yml", "-f", "docker-compose.override.yml"])
+
+    def test_sweep_recreates_only_the_faulted_services_and_deletes_generated_files(self):
+        self.cli("inject", "F06")                  # inventory faulted (F06)
+        self.stack.env["orders"] = self.stack._fault_env("orders", [])
+        self.stack.env["orders"] = [e for e in self.stack.env["orders"] if not e.startswith("DATABASE_URL=")] \
+            + ["DATABASE_URL=postgresql://shop:" + faults.WRONG_PASSWORD + "@postgres:5432/shop"]   # orders faulted (F08)
+        del self.stack.commands[:]
+        done = faults.sweep_config_faults(self.ctx.dk, ["orders", "payments", "inventory"])
+        self.assertEqual(done, [("F08", "orders"), ("F06", "inventory")])
+        recreated = [c[-1] for c in self.stack.commands if "up" in c]
+        self.assertEqual(recreated, ["orders", "inventory"])                              # payments was clean
+        self.assertEqual(self.stack.env, self.stack.base_env)
+        self.assertEqual(list((self.repo / "chaos" / "overrides").glob("*.yml")), [])
+
+    def test_sweep_ignores_a_service_without_container(self):
+        self.stack.removed.add("payments")
+        self.assertEqual(faults.sweep_config_faults(self.ctx.dk, ["payments"]), [])
+        self.assertFalse(any("up" in c for c in self.stack.commands))
+
+
+class ConfigFaultFlowTests(ConfigFaultBase):
+    """Status, stale detection and the late flag for F06/F08 (CP3 request 1), all with the fake docker."""
+
+    def recreate_by_hand(self, service):
+        self.stack.env[service] = list(self.stack.base_env[service])
+        self.stack.crash.discard(service)
+
+    def test_f06_normal_cycle_is_not_late(self):
+        self.assertEqual(self.cli("inject", "F06"), 0)
+        self.assertEqual(self.cli("inject", "F06"), 2)                                    # second inject refused
+        self.assertEqual(self.cli("clear", "F06"), 0)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(events[0]["expected_root_cause"], {"service": "inventory", "type": "misconfiguration"})
+        self.assertEqual(events[0]["expected_action"], "revert_config")
+
+    def test_f06_recreated_by_hand_is_stale_and_the_clear_is_late(self):
+        self.cli("inject", "F06")
+        self.recreate_by_hand("inventory")
+        del self.out[:]
+        self.assertEqual(self.cli("status"), 0)
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertTrue(any(line.startswith("stale = the effect is gone") for line in self.out))
+        self.assertEqual(self.cli("inject", "F06"), 2)                                    # a stale record blocks a new inject
+        self.assertTrue(any("stale" in line for line in self.out))
+        self.assertEqual(self.cli("clear", "F06"), 0)
+        events = self.events()
+        self.assertIs(events[1]["late"], True)
+        self.assertIs(events[2]["late"], True)
+        self.assertTrue(any("(late clear: the effect was already gone)" in line for line in self.out))
+
+    def test_f06_service_removed_is_stale_too(self):
+        self.cli("inject", "F06")
+        self.stack.removed.add("inventory")            # the container is gone; `clear` will create a clean one
+        self.stack.crash.discard("inventory")
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("clear", "F06"), 0)
+        self.assertIs(self.events()[1]["late"], True)
+
+    def test_f06_plain_restart_does_not_make_it_stale(self):
+        self.cli("inject", "F06")
+        self.stack.stopped.add("inventory")            # someone stops and starts it: the environment is the same
+        self.stack.stopped.discard("inventory")
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("active") for line in self.out))
+
+    def test_f08_normal_cycle_is_not_late(self):
+        self.assertEqual(self.cli("inject", "F08", "--target", "payments"), 0)
+        self.assertEqual(self.cli("status"), 0)
+        self.assertTrue(any(line.rstrip().endswith("active") for line in self.out))
+        self.assertEqual(self.cli("clear", "F08"), 0)
+        events = self.events()
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(events[0]["target"], "payments")
+        self.assertEqual(events[0]["expected_root_cause"], {"service": "payments", "type": "db_auth_failure"})
+
+    def test_f08_recreated_by_hand_is_stale_and_the_clear_is_late(self):
+        self.cli("inject", "F08")
+        self.recreate_by_hand("orders")
+        del self.out[:]
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("inject", "F08"), 2)
+        self.assertEqual(self.cli("clear", "F08"), 0)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+        self.assertIs(events[1]["late"], True)
+        self.assertIs(events[2]["late"], True)
+
+    def test_f08_after_the_override_file_was_removed_and_the_service_recreated(self):
+        self.cli("inject", "F08")
+        self.override_file("F08", "orders").unlink()
+        self.recreate_by_hand("orders")                # what `docker compose up -d orders` would do without the file
+        self.assertEqual(self.cli("clear", "F08"), 0)
+        self.assertIs(self.events()[1]["late"], True)
+
+    def test_run_of_f06_and_f08_writes_inject_clear_recovered_without_late(self):
+        self.assertEqual(self.cli("run", "F06", "--warmup", "1", "--hold", "5", "--cooldown", "1"), 0)
+        self.assertEqual(self.cli("run", "F08", "--warmup", "1", "--hold", "5", "--cooldown", "1"), 0)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"] * 2)
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(self.stack.env, self.stack.base_env)
+
+    def test_duration_is_refused_for_f06_and_f08(self):
+        self.assertEqual(self.cli("inject", "F06", "--duration", "30"), 2)
+        self.assertEqual(self.cli("inject", "F08", "--target", "gateway"), 2)
+        self.assertEqual(self.stack.commands, [])
+
+    def test_clear_all_repairs_a_faulted_service_without_any_record(self):
+        self.cli("inject", "F06")
+        self.ctx.state_path.unlink()                   # the record is lost
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "--all"), 0)
+        self.assertIn("recreated inventory from the base files (it still had the F06 fault)", self.out)
+        self.assertEqual(self.stack.env, self.stack.base_env)
+        self.assertNotIn("inventory", self.stack.crash)
+        self.assertEqual(list((self.repo / "chaos" / "overrides").glob("*.yml")), [])
+        self.assertIn("no active faults; the stack is healthy", self.out)
+
+    def test_clear_all_with_a_record_recreates_the_service_only_once(self):
+        self.cli("inject", "F08")
+        del self.stack.commands[:]
+        self.assertEqual(self.cli("clear", "--all"), 0)
+        recreations = [c for c in self.stack.commands if "--force-recreate" in c]
+        self.assertEqual(len(recreations), 1)
+        self.assertEqual(self.events()[-2]["event"], "clear")
+        self.assertNotIn("late", self.events()[-2])
+
+    def test_clear_all_after_ctrl_c_during_run_of_f06(self):
+        calls = {"n": 0}
+
+        def sleep(_seconds):
+            calls["n"] += 1
+            if calls["n"] == 2:                        # warm-up is the 1st sleep, hold the 2nd
+                raise KeyboardInterrupt
+        self.ctx.sleep = sleep
+        self.assertEqual(self.cli("run", "F06", "--warmup", "1", "--hold", "30", "--cooldown", "1"), 130)
+        self.assertEqual([e["event"] for e in self.events()], ["inject", "aborted", "clear", "recovered"])
+        self.assertEqual(self.stack.env, self.stack.base_env)
+        self.assertEqual(self.cli("clear", "--all"), 0)
+
+    def test_inject_failure_in_the_middle_is_rolled_back(self):
+        original = self.stack._up
+
+        def failing_up(args):
+            result = original(args)
+            if any(a.startswith("chaos/overrides/") for a in args):
+                return faults.CmdResult(1, "", "boom while recreating")
+            return result
+        self.stack._up = failing_up
+        self.assertEqual(self.cli("inject", "F08"), 1)
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+        self.assertFalse((self.root / "truth.jsonl").exists())
+        self.assertEqual(self.stack.env, self.stack.base_env)
+        self.assertFalse(self.override_file("F08", "orders").exists())
 
 
 if __name__ == "__main__":
