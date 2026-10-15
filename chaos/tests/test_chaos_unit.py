@@ -9,6 +9,7 @@ command sequences of F10 and F13.
 
 import base64
 import copy
+import os
 import json
 import re
 import signal
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 CHAOS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CHAOS_DIR))
@@ -152,12 +154,14 @@ class ArgumentValidationTests(unittest.TestCase):
             self.validate("F10", param_items=["x=1"])
 
     def test_fault_not_built_yet_is_refused_with_the_planned_checkpoint(self):
+        planned = {"F11": "CP4", "F18": "CP4"}
         for fid in ("F11", "F18"):
             with self.assertRaisesRegex(chaos.ValidationError, "not built yet.*CP4"):
-                chaos.validate_request(self.cat, fid, implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
+                chaos.validate_request(self.cat, fid, implemented={"F10", "F13"}, planned=planned)
 
     def test_the_built_faults(self):
-        self.assertEqual(sorted(faults.IMPLEMENTED), ["F01", "F02", "F06", "F08", "F10", "F13"])
+        self.assertEqual(sorted(faults.IMPLEMENTED), EXPECTED_IDS)             # all 8 faults of tier 1 after CP4
+        self.assertEqual(faults.PLANNED, {})
         request = chaos.validate_request(self.cat, "F01", param_items=["processes=3"],
                                          implemented=faults.IMPLEMENTED, planned=faults.PLANNED)
         self.assertEqual((request.target, request.duration_s, request.params), ("orders", 180, {"processes": 3}))
@@ -385,10 +389,18 @@ class FakeStack:
         self.crash = set()           # services in a crash loop
         self.reset_works = True      # False: the '!reset' tag does not remove the variable
         self.repo_root = CHAOS_DIR.parent
+        self.base_env["postgres"] = ["PATH=/usr/bin", "POSTGRES_USER=shop", "POSTGRES_PASSWORD=pgsecret-xyz",
+                                     "POSTGRES_DB=shop"]
+        self.env["postgres"] = list(self.base_env["postgres"])
+        self.sessions = []           # F11: [{"app": application_name, "lock": bool}] inside postgres
+        self.load = None             # F18: {"id", "status", "env"} of the chaos load container
+        self.envs = []               # (args, env) of every command that got an env
 
     # -- helpers --------------------------------------------------------------------------------
     def _service_of(self, cid):
         return cid[len("cid-"):]
+
+    LOAD_ID = "loadid" + "0" * 58
 
     def _fault_env(self, service, files):
         """Environment the service gets when compose merges the given -f files (only fault files matter here)."""
@@ -417,10 +429,13 @@ class FakeStack:
         service = args[args.index("-T") + 1]
         if self.exec_fails or service in self.stopped:
             return faults.CmdResult(1, "", f'service "{service}" is not running')
+        detach = args[args.index("exec") + 1] == "-d"
+        if "psql" in args:
+            return self._psql(args, service, detach)
         at = args.index("-c")
         code = base64.b64decode(args[at + 2]).decode()
         extra = args[at + 3:]
-        if "-d" in args:
+        if detach:
             self.procs[service] = self.procs.get(service, 0) + 1
             self.started.append((code, extra))
             return faults.CmdResult(0, "", "")
@@ -437,6 +452,28 @@ class FakeStack:
                 return faults.CmdResult(0, json.dumps({"state": self.f02_state, "held_mib": 8}) + "\n", "")
             return faults.CmdResult(0, "\n", "")
         return faults.CmdResult(0, "", "")
+
+    def _psql(self, args, service, detach):
+        user, database = args[args.index("-U") + 1], args[args.index("-d", args.index("psql")) + 1]
+        if (user, database) != ("shop", "shop"):
+            return faults.CmdResult(1, "", 'FATAL:  role "%s" does not exist' % user)
+        sql = args[args.index("-c") + 1]
+        app = "psql"
+        if "-e" in args:
+            app = args[args.index("-e") + 1].split("=", 1)[1]
+        if sql.startswith("BEGIN; LOCK TABLE items IN ACCESS EXCLUSIVE MODE;"):
+            assert detach, "the lock session must run detached"
+            self.sessions.append({"app": app, "lock": True, "sql": sql})
+            return faults.CmdResult(0, "", "")
+        mine = [x for x in self.sessions if x["app"] == faults.F11_APP_NAME]
+        if sql == faults.F11_COUNT_SQL:
+            return faults.CmdResult(0, f"{len(mine)}\n", "")
+        if sql == faults.F11_LOCK_SQL:
+            return faults.CmdResult(0, f"{len([x for x in mine if x['lock']])}\n", "")
+        if sql == faults.F11_TERMINATE_SQL:
+            self.sessions = [x for x in self.sessions if x["app"] != faults.F11_APP_NAME]
+            return faults.CmdResult(0, "t\n" * len(mine), "")
+        return faults.CmdResult(1, "", "unexpected sql in the fake: " + sql[:40])
 
     def _config(self, args):
         files = self._files(args)
@@ -457,6 +494,8 @@ class FakeStack:
 
     def _inspect(self, args):
         fmt, cid = args[args.index("--format") + 1], args[-1]
+        if cid == self.LOAD_ID:
+            return faults.CmdResult(0, (self.load["status"] if self.load else "") + "\n", "")
         service = self._service_of(cid)
         if fmt == "{{json .Config.Env}}":
             return faults.CmdResult(0, json.dumps(self.env.get(service, [])) + "\n", "")
@@ -465,8 +504,19 @@ class FakeStack:
         return faults.CmdResult(0, f"{self.memory_limit}\n", "")
 
     # -- the fake docker ------------------------------------------------------------------------
-    def runner(self, args, timeout):
+    def runner(self, args, timeout, env=None):
         self.commands.append(list(args))
+        if env:
+            self.envs.append((list(args), dict(env)))
+        if args[:2] == ["docker", "ps"]:
+            return faults.CmdResult(0, (self.LOAD_ID + "\n") if self.load else "", "")
+        if args[:2] == ["docker", "rm"]:
+            if self.load and args[-1] == self.LOAD_ID:
+                self.load = None
+            return faults.CmdResult(0, "", "")
+        if "run" in args and "--name" in args:
+            self.load = {"id": self.LOAD_ID, "status": "running", "env": dict(env or {})}
+            return faults.CmdResult(0, faults.LOAD_CONTAINER + "\n", "")
         if args[:2] == ["docker", "inspect"]:
             return self._inspect(args)
         if "exec" in args:
@@ -493,6 +543,8 @@ class FakeStack:
         if "stop" in args:
             self.stopped.add(args[-1])
             self.procs[args[-1]] = 0                     # processes die with the container
+            if args[-1] == "postgres":
+                self.sessions = []                       # sessions die with postgres
         elif "start" in args:
             self.stopped.discard(args[-1])
             if self.on_start:
@@ -633,7 +685,7 @@ class EndToEndWithFakeDockerTests(unittest.TestCase):
             ctx, _ = self.make_ctx(tmp, stack)
             for argv in (["inject", "F99"], ["inject", "F10", "--target", "redis"],
                          ["inject", "F10", "--duration", "9999"], ["inject", "F01", "--duration", "9999"],
-                         ["inject", "F11"], ["inject", "F01", "--param", "processes=9"],
+                         ["inject", "F11", "--target", "redis"], ["inject", "F01", "--param", "processes=9"],
                          ["inject", "F02", "--param", "step_mib=0"], ["clear"], ["clear", "F10", "--all"]):
                 with self.subTest(argv=argv):
                     self.assertEqual(chaos.main(argv, ctx), 2)
@@ -1436,6 +1488,516 @@ class ConfigFaultFlowTests(ConfigFaultBase):
         self.assertFalse((self.root / "truth.jsonl").exists())
         self.assertEqual(self.stack.env, self.stack.base_env)
         self.assertFalse(self.override_file("F08", "orders").exists())
+
+
+class LockAndLoadPureTests(unittest.TestCase):
+    """F11 and F18: SQL, arguments, environment, filters, the stale decision."""
+
+    def test_f11_sql_names_the_items_table_and_the_application_name(self):
+        self.assertEqual(faults.f11_hold_sql(120),
+                         "BEGIN; LOCK TABLE items IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(120); COMMIT;")
+        self.assertEqual(faults.f11_hold_sql("90"), faults.f11_hold_sql(90))
+        for sql in (faults.F11_COUNT_SQL, faults.F11_LOCK_SQL, faults.F11_TERMINATE_SQL):
+            self.assertIn("'chaos-F11'", sql)
+        self.assertIn("'items'::regclass", faults.F11_LOCK_SQL)
+        self.assertIn("pid <> pg_backend_pid()", faults.F11_TERMINATE_SQL)       # never kills its own connection
+
+    def test_psql_args(self):
+        self.assertEqual(faults.psql_args("u", "d", "SELECT 1"),
+                         ["psql", "-U", "u", "-d", "d", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-c", "SELECT 1"])
+
+    def test_the_hold_session_is_one_transaction_with_a_commit(self):
+        sql = faults.f11_hold_sql(5)
+        self.assertTrue(sql.startswith("BEGIN;") and sql.endswith("COMMIT;"))
+
+    def test_postgres_credentials_come_from_the_container_environment_without_the_password(self):
+        stack = FakeStack()
+        creds = faults.postgres_credentials(stack.docker())
+        self.assertEqual(creds, ("shop", "shop"))
+        self.assertNotIn("pgsecret-xyz", repr(creds))
+
+    def test_postgres_credentials_errors(self):
+        stack = FakeStack()
+        stack.env["postgres"] = ["POSTGRES_USER=shop"]
+        with self.assertRaisesRegex(faults.FaultError, "POSTGRES_DB is not set"):
+            faults.postgres_credentials(stack.docker())
+        stack.removed.add("postgres")
+        with self.assertRaisesRegex(faults.FaultError, "no postgres container"):
+            faults.postgres_credentials(stack.docker())
+
+    def test_f18_environment_is_what_the_compose_placeholders_read(self):
+        self.assertEqual(faults.load_environment(100, 20, 120), {"USERS": "100", "SPAWN_RATE": "20", "DURATION": "120s"})
+        self.assertEqual(faults.load_environment(150, 50, 60.0)["DURATION"], "60s")
+
+    def test_load_filters_require_name_project_service_and_oneoff(self):
+        joined = " ".join(faults.load_filters())
+        for part in ("name=^/sentinelops-chaos-load$", "com.docker.compose.project=sentinelops",
+                     "com.docker.compose.service=loadtest", "com.docker.compose.oneoff=True"):
+            self.assertIn(part, joined)
+
+    def test_effect_gone_for_f11(self):
+        running = {"postgres"}
+        self.assertFalse(faults.effect_gone("F11", "postgres", running, session_counts={"F11": 1}))
+        self.assertTrue(faults.effect_gone("F11", "postgres", running, session_counts={"F11": 0}))
+        self.assertTrue(faults.effect_gone("F11", "postgres", set(), session_counts={}))        # postgres not running
+        self.assertFalse(faults.effect_gone("F11", "postgres", running, session_counts={}))      # could not count
+        self.assertFalse(faults.effect_gone("F11", "postgres", running))
+
+    def test_effect_gone_for_f18(self):
+        self.assertFalse(faults.effect_gone("F18", "gateway", set(), load_states={"F18": "running"}))
+        self.assertTrue(faults.effect_gone("F18", "gateway", set(), load_states={"F18": "exited"}))
+        self.assertTrue(faults.effect_gone("F18", "gateway", set(), load_states={"F18": "missing"}))
+        self.assertFalse(faults.effect_gone("F18", "gateway", set(), load_states={}))            # unknown
+        self.assertFalse(faults.effect_gone("F18", "gateway", {"gateway"}))
+
+    def test_counts_and_states_skip_what_cannot_be_read(self):
+        stack = FakeStack()
+        dk = stack.docker()
+        records = [{"fault_id": "F11", "target": "postgres"}, {"fault_id": "F18", "target": "gateway"},
+                   {"fault_id": "F10", "target": "postgres"}]
+        stack.sessions.append({"app": "chaos-F11", "lock": True})
+        stack.load = {"id": stack.LOAD_ID, "status": "running", "env": {}}
+        self.assertEqual(faults.session_counts(dk, records, {"postgres"}), {"F11": 1})
+        self.assertEqual(faults.session_counts(dk, records, set()), {})
+        self.assertEqual(faults.load_states(dk, records), {"F18": "running"})
+        original = dk.runner
+
+        def broken(args, timeout, env=None):
+            if "exec" in args or args[:2] in (["docker", "ps"], ["docker", "inspect"]):
+                return faults.CmdResult(1, "", "boom")
+            return original(args, timeout)
+        dk.runner = broken
+        self.assertEqual(faults.session_counts(dk, records, {"postgres"}), {})
+        self.assertEqual(faults.load_states(dk, records), {})
+
+
+class DockerEnvTests(unittest.TestCase):
+    """The environment for one docker compose command (F18)."""
+
+    def test_default_runner_adds_the_env_to_the_current_environment(self):
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen.update(kwargs)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(faults.subprocess, "run", fake_run):
+            faults.default_runner(["docker", "compose", "ps"], 5, {"USERS": "100"})
+            self.assertEqual(seen["env"]["USERS"], "100")
+            self.assertIn("PATH", {k.upper() for k in seen["env"]})          # the rest of the environment is kept
+            self.assertIs(seen["shell"], False)
+            faults.default_runner(["docker", "compose", "ps"], 5)
+            self.assertIsNone(seen["env"])
+
+    def test_the_docker_child_gets_its_own_process_group(self):
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen.update(kwargs)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(faults.subprocess, "run", fake_run):
+            faults.default_runner(["docker", "ps"], 5)
+        if os.name == "nt":
+            self.assertIn("creationflags", seen)
+        else:
+            self.assertIs(seen["start_new_session"], True)
+
+    def test_env_is_printed_as_a_prefix_and_only_given_to_a_runner_that_gets_one(self):
+        echoed, calls = [], []
+
+        def runner(args, timeout, env=None):
+            calls.append(env)
+            return faults.CmdResult(0, "", "")
+        dk = faults.Docker(runner=runner, echo=echoed.append, repo_root=Path("."))
+        dk.compose("run", "x", env={"USERS": "100", "DURATION": "120s"})
+        dk.compose("ps")
+        self.assertTrue(echoed[0].startswith("+ (env USERS=100 DURATION=120s) docker compose"))
+        self.assertFalse(echoed[1].startswith("+ (env"))
+        self.assertEqual(calls, [{"USERS": "100", "DURATION": "120s"}, None])
+
+    def test_a_runner_without_env_support_still_works_when_no_env_is_given(self):
+        dk = faults.Docker(runner=lambda args, timeout: faults.CmdResult(0, "ok", ""), echo=lambda _m: None,
+                           repo_root=Path("."))
+        self.assertEqual(dk.compose("ps").stdout, "ok")
+
+
+class Cp4Base(ConfigFaultBase):
+    def shown(self):
+        return [re.sub(r"(F\d\d)-[0-9a-f]{8}", r"\1-<id>", re.sub(r"recovered \d+\.\d s", "recovered <t> s", line))
+                for line in self.out]
+
+    def compose(self):
+        return "docker compose -f docker-compose.yml -f docker-compose.override.yml"
+
+
+class F11Tests(Cp4Base):
+    def lock_command(self, seconds):
+        sql = faults.f11_hold_sql(seconds)
+        return (f"+ {self.compose()} exec -d -T -e PGAPPNAME=chaos-F11 postgres psql -U shop -d shop -X -v "
+                f"ON_ERROR_STOP=1 -At -c {sql[:24]}...({len(sql)} chars)")
+
+    def terminate_command(self):
+        sql = faults.F11_TERMINATE_SQL
+        return (f"+ {self.compose()} exec -T postgres psql -U shop -d shop -X -v ON_ERROR_STOP=1 -At -c "
+                f"{sql[:24]}...({len(sql)} chars)")
+
+    def test_inject_prints_exactly_these_lines(self):
+        self.assertEqual(self.cli("inject", "F11"), 0)
+        self.assertEqual(self.shown(), [
+            self.lock_command(120),
+            "verified: a session named chaos-F11 holds an ACCESS EXCLUSIVE lock on items",
+            "injected F11 on postgres (run id F11-<id>)",
+            "it ends by itself after 120 s; end it earlier with: python chaos/chaos.py clear F11",
+        ])
+        session = self.stack.sessions[0]
+        self.assertEqual((session["app"], session["lock"]), ("chaos-F11", True))
+        self.assertIn("pg_sleep(120)", session["sql"])
+
+    def test_clear_prints_exactly_these_lines_and_only_ends_the_chaos_session(self):
+        self.stack.sessions.append({"app": "psql", "lock": False})                # somebody else's session
+        self.cli("inject", "F11")
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "F11"), 0)
+        self.assertEqual(self.shown(), [
+            self.terminate_command(),
+            "verified: no chaos-F11 session is left",
+            "cleared F11 (run id F11-<id>)",
+            "waiting for all 6 containers to be healthy and the gateway to answer 200 ...",
+            "F11: recovered <t> s after the clear",
+        ])
+        self.assertEqual([x["app"] for x in self.stack.sessions], ["psql"])
+
+    def test_duration_is_used_for_pg_sleep(self):
+        self.assertEqual(self.cli("inject", "F11", "--duration", "90"), 0)
+        self.assertIn("pg_sleep(90)", self.stack.sessions[0]["sql"])
+        self.assertEqual(self.cli("inject", "F11", "--duration", "601"), 2)
+
+    def test_inject_refuses_when_a_chaos_session_already_exists(self):
+        self.stack.sessions.append({"app": "chaos-F11", "lock": True})
+        self.assertEqual(self.cli("inject", "F11"), 1)
+        self.assertTrue(any("already exist" in line for line in self.out))
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+        self.assertFalse((self.root / "truth.jsonl").exists())
+
+    def test_inject_fails_clearly_when_the_lock_is_never_taken(self):
+        original = self.stack._psql
+
+        def no_lock(args, service, detach):
+            result = original(args, service, detach)
+            self.stack.sessions[:] = [dict(x, lock=False) for x in self.stack.sessions]
+            return result
+        self.stack._psql = no_lock
+        self.assertEqual(self.cli("inject", "F11"), 1)
+        self.assertTrue(any("timeout after 20 s" in line and "hold the lock" in line for line in self.out))
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})                  # rolled back
+        self.assertEqual(self.stack.sessions, [])
+
+    def test_clear_when_postgres_is_stopped_prints_a_note_and_runs_no_sql(self):
+        self.stack.stopped.add("postgres")
+        del self.stack.commands[:]
+        faults.clear_f11(self.ctx.dk, {"target": "postgres"})
+        self.assertIn("postgres is not running: the chaos-F11 session ended with it", self.out)
+        self.assertFalse(any("exec" in c for c in self.stack.commands))
+
+    def test_clear_fails_and_keeps_the_record_when_the_session_cannot_be_ended(self):
+        self.cli("inject", "F11")
+        original = self.stack._psql
+
+        def stubborn(args, service, detach):
+            if args[args.index("-c") + 1] == faults.F11_TERMINATE_SQL:
+                return faults.CmdResult(0, "t\n", "")               # says it worked, but the session stays
+            return original(args, service, detach)
+        self.stack._psql = stubborn
+        self.assertEqual(self.cli("clear", "F11"), 1)
+        self.assertTrue(any("timeout after 20 s" in line and "still exist" in line for line in self.out))
+        self.assertIn("F11", chaos.read_state(self.ctx.state_path))             # can be cleared again
+        self.stack._psql = original
+        self.assertEqual(self.cli("clear", "F11"), 0)
+
+    def test_normal_cycle_status_and_second_inject(self):
+        self.assertEqual(self.cli("inject", "F11"), 0)
+        self.assertEqual(self.cli("status"), 0)
+        self.assertTrue(any(line.rstrip().endswith("active") for line in self.out))
+        self.assertEqual(self.cli("inject", "F11"), 2)
+        self.assertEqual(self.cli("clear", "F11"), 0)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(events[0]["expected_root_cause"], {"service": "postgres", "type": "db_lock_contention"})
+        self.assertEqual(events[0]["expected_action"], "terminate_blocking_query")
+        self.assertEqual(events[0]["params"], {})
+
+    def test_session_ended_by_hand_is_stale_and_the_clear_is_late(self):
+        self.cli("inject", "F11")
+        self.stack.sessions.clear()                      # someone ran pg_terminate_backend, or the duration is over
+        del self.out[:]
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("inject", "F11"), 2)
+        self.assertTrue(any("stale" in line for line in self.out))
+        self.assertEqual(self.cli("clear", "F11"), 0)
+        events = self.events()
+        self.assertIs(events[1]["late"], True)
+        self.assertIs(events[2]["late"], True)
+        self.assertTrue(any("(late clear: the effect was already gone)" in line for line in self.out))
+
+    def test_postgres_restarted_means_the_session_is_gone_and_stale(self):
+        self.cli("inject", "F11")
+        self.cli("run", "F10", "--warmup", "0", "--hold", "1", "--cooldown", "0")     # stops and starts postgres
+        self.assertEqual(self.stack.sessions, [])
+        del self.out[:]
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("clear", "F11"), 0)
+        self.assertIs([e for e in self.events() if e["fault_id"] == "F11"][1]["late"], True)
+
+    def test_run_outlasts_the_hold_so_the_clear_is_not_late(self):
+        self.assertEqual(self.cli("run", "F11", "--warmup", "1", "--hold", "20", "--cooldown", "1"), 0)
+        lock = [c for c in self.stack.commands if "exec" in c and c[c.index("exec") + 1] == "-d"]
+        self.assertIn("pg_sleep(50)", lock[0][-1])               # hold 20 s + the 30 s margin
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+        self.assertTrue(all("late" not in e for e in events))
+
+    def test_no_password_in_any_command_message_or_file(self):
+        self.cli("inject", "F11")
+        self.cli("clear", "F11")
+        everything = "\n".join(self.out) + (self.root / "truth.jsonl").read_text(encoding="utf-8")
+        everything += "\n".join(" ".join(c) for c in self.stack.commands)
+        self.assertNotIn("pgsecret-xyz", everything)
+
+
+class F18Tests(Cp4Base):
+    def load_command(self, users, spawn, seconds):
+        return (f"+ (env USERS={users} SPAWN_RATE={spawn} DURATION={seconds}s) {self.compose()} --profile load run -d "
+                f"--no-deps --name sentinelops-chaos-load loadtest")
+
+    def rm_command(self):
+        text = faults.display_command(["docker", "rm", "-f", self.stack.LOAD_ID])
+        return "+ " + text
+
+    def test_inject_prints_exactly_these_lines_and_passes_the_values_in_the_environment(self):
+        self.assertEqual(self.cli("inject", "F18"), 0)
+        self.assertEqual(self.shown(), [
+            self.load_command(100, 20, 120),
+            "verified: the load container sentinelops-chaos-load is running (100 users, 20 per s, 120 s)",
+            "injected F18 on gateway (run id F18-<id>)",
+            "it ends by itself after 120 s; end it earlier with: python chaos/chaos.py clear F18",
+        ])
+        command, env = self.stack.envs[-1]
+        self.assertEqual(env, {"USERS": "100", "SPAWN_RATE": "20", "DURATION": "120s"})
+        self.assertNotIn("-e", command)                                  # NOT `run -e`: that only sets container variables
+        self.assertNotIn("USERS=100", " ".join(command))
+        self.assertEqual(command[command.index("--name") + 1], "sentinelops-chaos-load")
+        self.assertIn("--no-deps", command)
+
+    def test_params_and_duration(self):
+        self.assertEqual(self.cli("inject", "F18", "--param", "users=150", "--param", "spawn_rate=50",
+                                  "--duration", "60"), 0)
+        self.assertEqual(self.stack.envs[-1][1], {"USERS": "150", "SPAWN_RATE": "50", "DURATION": "60s"})
+
+    def test_refusals(self):
+        for argv in (["inject", "F18", "--param", "users=20"], ["inject", "F18", "--param", "users=151"],
+                     ["inject", "F18", "--param", "spawn_rate=0"], ["inject", "F18", "--param", "spawn_rate=51"],
+                     ["inject", "F18", "--target", "orders"], ["inject", "F18", "--duration", "601"],
+                     ["inject", "F18", "--param", "users=many"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.cli(*argv), 2)
+        self.assertEqual(self.stack.commands, [])
+
+    def test_clear_prints_exactly_these_lines_and_removes_by_id(self):
+        self.cli("inject", "F18")
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "F18"), 0)
+        self.assertEqual(self.shown(), [
+            self.rm_command(),
+            "cleared F18 (run id F18-<id>)",
+            "waiting for all 6 containers to be healthy and the gateway to answer 200 ...",
+            "F18: recovered <t> s after the clear",
+        ])
+        self.assertIsNone(self.stack.load)
+        ps = [c for c in self.stack.commands if c[:2] == ["docker", "ps"]]
+        self.assertTrue(all("--filter" in c and "label=com.docker.compose.oneoff=True" in c for c in ps))
+        rm = [c for c in self.stack.commands if c[:2] == ["docker", "rm"]]
+        self.assertEqual(rm, [["docker", "rm", "-f", self.stack.LOAD_ID]])            # by id, never by a pattern
+
+    def test_inject_refuses_when_a_load_container_is_left_over(self):
+        self.stack.load = {"id": self.stack.LOAD_ID, "status": "exited", "env": {}}
+        self.assertEqual(self.cli("inject", "F18"), 1)
+        self.assertTrue(any("already exists (exited)" in line for line in self.out))
+        self.assertFalse((self.root / "truth.jsonl").exists())
+
+    def test_inject_fails_when_the_container_stops_right_after_the_start(self):
+        self.ctx.dk.sleep = lambda _s: self.stack.load.update(status="exited")
+        self.assertEqual(self.cli("inject", "F18"), 1)
+        self.assertTrue(any("stopped right after it started" in line for line in self.out))
+        self.assertIsNone(self.stack.load)                                             # rolled back
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+
+    def test_clear_fails_and_keeps_the_record_when_the_container_cannot_be_removed(self):
+        self.cli("inject", "F18")
+        original = self.stack.runner
+
+        def stubborn(args, timeout, env=None):
+            if args[:2] == ["docker", "rm"]:
+                return faults.CmdResult(0, "", "")                         # says it worked, but the container stays
+            return original(args, timeout, env)
+        self.ctx.dk.runner = stubborn
+        self.assertEqual(self.cli("clear", "F18"), 1)
+        self.assertTrue(any("timeout after 30 s" in line and "still exists" in line for line in self.out))
+        self.assertIn("F18", chaos.read_state(self.ctx.state_path))
+        self.ctx.dk.runner = original
+        self.assertEqual(self.cli("clear", "F18"), 0)
+
+    def test_clear_with_no_container_is_not_an_error(self):
+        self.cli("inject", "F18")
+        self.stack.load = None                                                          # removed by hand
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "F18"), 0)
+        self.assertIn("there is no sentinelops-chaos-load container: nothing to remove", self.out)
+
+    def test_normal_cycle(self):
+        self.assertEqual(self.cli("inject", "F18"), 0)
+        self.assertEqual(self.cli("status"), 0)
+        self.assertTrue(any(line.rstrip().endswith("active") for line in self.out))
+        self.assertEqual(self.cli("inject", "F18"), 2)
+        self.assertEqual(self.cli("clear", "F18"), 0)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+        self.assertTrue(all("late" not in e for e in events))
+        self.assertEqual(events[0]["params"], {"users": 100, "spawn_rate": 20})
+        self.assertEqual(events[0]["expected_root_cause"], {"service": None, "type": "capacity_limit"})
+        self.assertEqual(events[0]["expected_action"], "scale_service")
+
+    def test_load_generator_finished_is_stale_and_the_clear_is_late(self):
+        self.cli("inject", "F18")
+        self.stack.load["status"] = "exited"             # the duration is over: Locust ended, the container exited
+        del self.out[:]
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("inject", "F18"), 2)
+        self.assertEqual(self.cli("clear", "F18"), 0)
+        events = self.events()
+        self.assertIs(events[1]["late"], True)
+        self.assertIs(events[2]["late"], True)
+        self.assertIsNone(self.stack.load)                # the finished container is removed by the clear
+
+    def test_load_container_removed_by_hand_is_stale_and_the_clear_is_late(self):
+        self.cli("inject", "F18")
+        self.stack.load = None
+        self.cli("status")
+        self.assertTrue(any(line.rstrip().endswith("stale") for line in self.out))
+        self.assertEqual(self.cli("clear", "F18"), 0)
+        self.assertIs(self.events()[1]["late"], True)
+
+    def test_run_outlasts_the_hold_so_the_clear_is_not_late(self):
+        self.assertEqual(self.cli("run", "F18", "--warmup", "1", "--hold", "20", "--cooldown", "1"), 0)
+        self.assertEqual(self.stack.envs[-1][1]["DURATION"], "50s")
+        self.assertTrue(all("late" not in e for e in self.events()))
+
+    def test_ctrl_c_during_run_removes_the_load_container(self):
+        calls = {"n": 0}
+
+        def sleep(_seconds):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+        self.ctx.sleep = sleep
+        self.assertEqual(self.cli("run", "F18", "--warmup", "1", "--hold", "30", "--cooldown", "1"), 130)
+        self.assertEqual([e["event"] for e in self.events()], ["inject", "aborted", "clear", "recovered"])
+        self.assertIsNone(self.stack.load)
+
+
+class ClearAllF11F18Tests(Cp4Base):
+    def test_clear_all_ends_leftover_session_and_load_container_without_any_record(self):
+        self.cli("inject", "F11")
+        self.cli("inject", "F18")
+        self.ctx.state_path.unlink()
+        del self.out[:]
+        self.assertEqual(self.cli("clear", "--all"), 0)
+        self.assertIn("ended 1 leftover F11 session(s) in postgres", self.out)
+        self.assertIn("removed the leftover F18 load container sentinelops-chaos-load", self.out)
+        self.assertEqual(self.stack.sessions, [])
+        self.assertIsNone(self.stack.load)
+        self.assertIn("no active faults; the stack is healthy", self.out)
+
+    def test_clear_all_with_records_clears_each_once(self):
+        self.cli("inject", "F11")
+        self.cli("inject", "F18")
+        del self.stack.commands[:]
+        self.assertEqual(self.cli("clear", "--all"), 0)
+        self.assertEqual(len([c for c in self.stack.commands if c[:2] == ["docker", "rm"]]), 1)
+        self.assertEqual(len([e for e in self.events() if e["event"] == "clear"]), 2)
+        self.assertTrue(all("late" not in e for e in self.events()))
+
+    def test_clear_all_removes_a_finished_load_container(self):
+        self.stack.load = {"id": self.stack.LOAD_ID, "status": "exited", "env": {}}
+        self.assertEqual(self.cli("clear", "--all"), 0)
+        self.assertIsNone(self.stack.load)
+
+    def test_clear_all_skips_the_session_check_when_postgres_is_stopped(self):
+        self.stack.stopped.add("postgres")
+        self.assertEqual(self.cli("clear", "--all"), 0)               # postgres is started by the heal step first
+        self.assertEqual(self.stack.stopped, set())
+
+
+class RunLifecycleTests(Cp4Base):
+    """The whole `run` lifecycle for every fault of tier 1, with the fake docker."""
+
+    def test_run_writes_inject_clear_recovered_with_a_recovery_time_for_every_fault(self):
+        for fid in EXPECTED_IDS:
+            with self.subTest(fault=fid):
+                del self.out[:]
+                before = len(self.events()) if (self.root / "truth.jsonl").exists() else 0
+                self.assertEqual(self.cli("run", fid, "--warmup", "0", "--hold", "5", "--cooldown", "0"), 0, self.out)
+                events = self.events()[before:]
+                self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])
+                self.assertEqual(len({e["run_id"] for e in events}), 1)
+                self.assertTrue(events[0]["ts"] <= events[1]["ts"] <= events[2]["ts"])
+                self.assertIsInstance(events[2]["recovery_s"], float)
+                self.assertGreaterEqual(events[2]["recovery_s"], 0)
+                self.assertTrue(all("late" not in e for e in events))
+                self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+                self.assertEqual(faults.not_healthy(faults.service_states(self.ctx.dk.ps())), [])
+                self.assertEqual(self.stack.env, self.stack.base_env)
+                self.assertEqual((self.stack.sessions, self.stack.load), ([], None))
+
+    def test_ctrl_c_during_the_hold_clears_every_fault_and_marks_the_run_aborted(self):
+        for fid in EXPECTED_IDS:
+            with self.subTest(fault=fid):
+                calls = {"n": 0}
+
+                def sleep(_seconds, calls=calls):
+                    calls["n"] += 1
+                    if calls["n"] == 1:                      # no warm-up: the first sleep is the hold
+                        raise KeyboardInterrupt
+                self.ctx.sleep = sleep
+                before = len(self.events()) if (self.root / "truth.jsonl").exists() else 0
+                self.assertEqual(self.cli("run", fid, "--warmup", "0", "--hold", "30", "--cooldown", "0"), 130)
+                events = self.events()[before:]
+                self.assertEqual([e["event"] for e in events], ["inject", "aborted", "clear", "recovered"])
+                self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+                self.assertEqual(self.stack.env, self.stack.base_env)
+                self.assertEqual((self.stack.sessions, self.stack.load), ([], None))
+
+    def test_recovery_s_is_measured_from_the_clear_to_the_recovered_event(self):
+        stamps = iter(["2026-10-14T10:00:00.000Z", "2026-10-14T10:00:05.000Z", "2026-10-14T10:00:12.400Z"])
+        self.ctx.now = lambda: next(stamps)
+        self.assertEqual(self.cli("run", "F10", "--warmup", "0", "--hold", "1", "--cooldown", "0"), 0)
+        events = self.events()
+        self.assertEqual([e["ts"] for e in events], ["2026-10-14T10:00:00.000Z", "2026-10-14T10:00:05.000Z",
+                                                     "2026-10-14T10:00:12.400Z"])
+        self.assertEqual(events[2]["recovery_s"], 7.4)
+
+    def test_run_with_a_timed_fault_uses_the_hold_for_the_fault_duration(self):
+        self.cli("run", "F01", "--warmup", "0", "--hold", "40", "--cooldown", "0")
+        self.cli("run", "F02", "--warmup", "0", "--hold", "40", "--cooldown", "0")
+        self.cli("run", "F11", "--warmup", "0", "--hold", "40", "--cooldown", "0")
+        self.cli("run", "F18", "--warmup", "0", "--hold", "40", "--cooldown", "0")
+        self.assertEqual({extra[1] for _code, extra in self.stack.started}, {"70"})       # F01 and F02: 40 s + 30 s
+        lock = [c for c in self.stack.commands if "exec" in c and c[c.index("exec") + 1] == "-d"
+                and "postgres" in c]
+        self.assertIn("pg_sleep(70)", lock[0][-1])
+        self.assertEqual(self.stack.envs[-1][1]["DURATION"], "70s")
 
 
 if __name__ == "__main__":

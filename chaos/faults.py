@@ -7,7 +7,9 @@ Built so far:
   F02  Memory growth     (allocator python process inside payments)            CP2
   F06  Missing variable  (service recreated without DATABASE_URL: crash loop)  CP3
   F08  Wrong credential  (service recreated with a wrong DATABASE_URL password) CP3
-The other two faults of the catalogue (F11, F18) are added in CP4.
+  F11  Lock contention   (background psql session holds a lock on the items table) CP4
+  F18  Traffic spike     (the M1 load test image with more users, own container)  CP4
+All 8 faults of tier 1 are built after CP4.
 
 Design decisions (explain these in the viva):
   * Standard library only (decision D44). Every docker call is `subprocess` with an
@@ -57,8 +59,12 @@ class CmdResult:
     stderr: str
 
 
-def default_runner(args, timeout):
-    """Run one command (argument list, no shell) in the repo root and capture its output."""
+def default_runner(args, timeout, env=None):
+    """Run one command (argument list, no shell) in the repo root and capture its output.
+
+    env: extra environment variables for this one command (added to the current environment). docker compose
+    reads them for the ${VAR} placeholders of the compose file (F18: USERS, SPAWN_RATE, DURATION).
+    """
     # The docker child gets its own process group: a Ctrl+C typed in the console then reaches only
     # this Python process, so `run` can finish its clear even when Ctrl+C is pressed again.
     if os.name == "nt":
@@ -75,6 +81,7 @@ def default_runner(args, timeout):
             errors="replace",
             timeout=timeout,
             shell=False,
+            env=({**os.environ, **env} if env else None),
             **group,
         )
     except FileNotFoundError:
@@ -118,11 +125,13 @@ class Docker:
             cmd += ["-f", name]
         return cmd
 
-    def _run(self, cmd, timeout, show):
+    def _run(self, cmd, timeout, show, env=None):
         shown = self.mask(display_command(cmd))
         if show:
-            self.echo("+ " + shown)
-        result = self.runner(cmd, timeout)
+            prefix = "(env " + " ".join(f"{k}={v}" for k, v in env.items()) + ") " if env else ""
+            self.echo("+ " + self.mask(prefix) + shown)
+        # A runner that does not know about env (the old test runners) is only called with env when one is given.
+        result = self.runner(cmd, timeout, env) if env else self.runner(cmd, timeout)
         if result.returncode != 0:
             detail = self.mask(result.stderr.strip() or result.stdout.strip())
             hint = ""
@@ -132,10 +141,10 @@ class Docker:
             raise FaultError(f"command failed with exit code {result.returncode}: {shown}\n{detail}{hint}")
         return result
 
-    def compose(self, *args, timeout=DOCKER_TIMEOUT_S, show=True, files=()):
-        """Run `docker compose <args>`. `files` are extra -f files (a generated fault file).
-        Raises FaultError on a non-zero exit code."""
-        return self._run(self.compose_base(files) + [str(a) for a in args], timeout, show)
+    def compose(self, *args, timeout=DOCKER_TIMEOUT_S, show=True, files=(), env=None):
+        """Run `docker compose <args>`. `files` are extra -f files (a generated fault file); `env` is extra
+        environment for this command only. Raises FaultError on a non-zero exit code."""
+        return self._run(self.compose_base(files) + [str(a) for a in args], timeout, show, env)
 
     def docker(self, *args, timeout=DOCKER_TIMEOUT_S, show=True):
         """Run plain `docker <args>` (used only to read `docker inspect` of a compose container)."""
@@ -221,7 +230,8 @@ def running_services(states):
     return {name for name, (state, _health) in states.items() if state == "running"}
 
 
-def effect_gone(fault_id, target, running, process_counts=None, config_states=None):
+def effect_gone(fault_id, target, running, process_counts=None, config_states=None,
+                session_counts=None, load_states=None):
     """Stale-state decision: True when the effect of an active fault is no longer there.
 
     F10 and F13 stop a container, so the effect is gone as soon as that container runs again
@@ -235,11 +245,22 @@ def effect_gone(fault_id, target, running, process_counts=None, config_states=No
     `clear`, by M8) or it does not exist any more. config_states is {fault_id: "faulted" | "clean" |
     "missing"}; a missing entry means "could not be read" and is NOT reported as stale. Restarting the
     container keeps its environment, so a restart alone does not make F06/F08 stale.
+    F11 is a database session: the effect is gone when postgres is not running or no session named
+    chaos-F11 is left (duration over, or someone ended it). session_counts is {fault_id: number of sessions}.
+    F18 is a load container: the effect is gone when that container has exited (the load generator finished)
+    or does not exist (removed by hand). load_states is {fault_id: "running" | "exited" | "missing"}.
+    For both, a missing entry means "could not be read" and is NOT reported as stale.
     """
     if fault_id in ("F10", "F13"):
         return target in running
     if fault_id in CONFIG_FAULTS:
         return (config_states or {}).get(fault_id) in ("clean", "missing")
+    if fault_id == "F11":
+        if target not in running:
+            return True
+        return (session_counts or {}).get(fault_id) == 0
+    if fault_id == "F18":
+        return (load_states or {}).get(fault_id) in ("exited", "missing")
     if fault_id in PROCESS_FAULTS:
         if target not in running:
             return True
@@ -804,6 +825,243 @@ def sweep_config_faults(dk, targets):
     return recreated
 
 
+# ---------------------------------------------------------------------------
+# F11: lock contention (a background psql session in the postgres container)
+# ---------------------------------------------------------------------------
+# How it works, in short:
+#   * inject starts `psql` detached inside the postgres container. The session has the application
+#     name chaos-F11 (PGAPPNAME). It opens a transaction, takes an ACCESS EXCLUSIVE lock on the table
+#     that inventory reserves stock from (items, see db/init.sql) and sleeps for the duration.
+#   * inventory's reservation queries then wait for the lock until their own timeouts fire.
+#   * psql connects through the local unix socket of the postgres image (trust), so no password is
+#     used. The database user and name are read from the postgres container's environment (the values
+#     come from .env through docker-compose.yml); the password entry is never looked at.
+#   * clear ends the session with pg_terminate_backend, found through the application name, and waits
+#     until it is gone. The session also ends by itself after the duration (COMMIT).
+
+F11_APP_NAME = "chaos-F11"
+F11_TABLE = "items"
+F11_START_TIMEOUT_S = 20
+F11_STOP_TIMEOUT_S = 20
+
+F11_COUNT_SQL = f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{F11_APP_NAME}'"
+F11_LOCK_SQL = ("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                f"WHERE a.application_name = '{F11_APP_NAME}' AND l.locktype = 'relation' "
+                f"AND l.mode = 'AccessExclusiveLock' AND l.granted AND l.relation = '{F11_TABLE}'::regclass")
+F11_TERMINATE_SQL = ("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                     f"WHERE application_name = '{F11_APP_NAME}' AND pid <> pg_backend_pid()")
+
+
+def f11_hold_sql(duration_s):
+    """The transaction of the background session: lock, sleep, commit (the lock ends with the commit)."""
+    return f"BEGIN; LOCK TABLE {F11_TABLE} IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep({int(duration_s)}); COMMIT;"
+
+
+def psql_args(user, database, sql):
+    """psql arguments after the service name. -X: no .psqlrc, ON_ERROR_STOP: stop at the first error, -At: bare output."""
+    return ["psql", "-U", user, "-d", database, "-X", "-v", "ON_ERROR_STOP=1", "-At", "-c", sql]
+
+
+def postgres_credentials(dk):
+    """(user, database) from the postgres container environment. The password entry is not read or kept."""
+    env = container_env(dk, "postgres")
+    if env is None:
+        raise FaultError("there is no postgres container")
+    found = {}
+    for item in env:
+        for key in ("POSTGRES_USER", "POSTGRES_DB"):
+            if item.startswith(key + "="):
+                found[key] = item[len(key) + 1:]
+    for key in ("POSTGRES_USER", "POSTGRES_DB"):
+        if not found.get(key):
+            raise FaultError(f"{key} is not set in the postgres container")
+    return found["POSTGRES_USER"], found["POSTGRES_DB"]
+
+
+def run_sql(dk, creds, sql, show=False):
+    """Run one SQL statement with psql inside the postgres container and return its bare output."""
+    user, database = creds
+    return dk.compose("exec", "-T", "postgres", *psql_args(user, database, sql), show=show).stdout.strip()
+
+
+def _count(dk, creds, sql, what):
+    out = run_sql(dk, creds, sql)
+    try:
+        return int(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise FaultError(f"cannot read the {what} from postgres: unexpected output {out[:60]!r}")
+
+
+def count_f11_sessions(dk, creds=None):
+    """Number of sessions named chaos-F11 (they hold or wait for the lock)."""
+    return _count(dk, creds or postgres_credentials(dk), F11_COUNT_SQL, "number of chaos-F11 sessions")
+
+
+def session_counts(dk, records, running):
+    """{fault_id: session count} for the active F11 records whose postgres container is running.
+
+    A failed count is left out: unknown is never reported as stale.
+    """
+    counts = {}
+    for record in records:
+        if record["fault_id"] == "F11" and record["target"] in running:
+            try:
+                counts["F11"] = count_f11_sessions(dk)
+            except FaultError:
+                pass
+    return counts
+
+
+def inject_f11(dk, request):
+    """Lock contention: a background session holds an ACCESS EXCLUSIVE lock on the items table."""
+    creds = postgres_credentials(dk)
+    left = count_f11_sessions(dk, creds)
+    if left:
+        raise FaultError(f"{left} session(s) named {F11_APP_NAME} already exist in postgres. "
+                         f"Run first: python chaos/chaos.py clear --all")
+    user, database = creds
+    dk.compose("exec", "-d", "-T", "-e", f"PGAPPNAME={F11_APP_NAME}", "postgres",
+               *psql_args(user, database, f11_hold_sql(request["duration_s"])))
+
+    def check():
+        holders = _count(dk, creds, F11_LOCK_SQL, "number of lock holders")
+        return (holders >= 1, f"{holders} chaos-F11 session(s) hold the lock")
+    wait_until(dk, check, f"the {F11_APP_NAME} session to take the lock", F11_START_TIMEOUT_S)
+    dk.echo(f"verified: a session named {F11_APP_NAME} holds an ACCESS EXCLUSIVE lock on {F11_TABLE}")
+
+
+def _end_f11_sessions(dk, creds):
+    run_sql(dk, creds, F11_TERMINATE_SQL, show=True)
+
+    def check():
+        count = count_f11_sessions(dk, creds)
+        return (count == 0, f"{count} {F11_APP_NAME} session(s) still exist")
+    wait_until(dk, check, f"the {F11_APP_NAME} session to end", F11_STOP_TIMEOUT_S)
+
+
+def clear_f11(dk, record):
+    """End the session with pg_terminate_backend and verify that it is gone. Safe to repeat."""
+    if record["target"] not in running_services(service_states(dk.ps())):
+        dk.echo(f"{record['target']} is not running: the {F11_APP_NAME} session ended with it")
+        return
+    _end_f11_sessions(dk, postgres_credentials(dk))
+    dk.echo(f"verified: no {F11_APP_NAME} session is left")
+
+
+def sweep_lock_sessions(dk):
+    """For `clear --all`: end chaos-F11 sessions that have no record. Returns how many were found."""
+    if "postgres" not in running_services(service_states(dk.ps())):
+        return 0
+    creds = postgres_credentials(dk)
+    found = count_f11_sessions(dk, creds)
+    if found:
+        _end_f11_sessions(dk, creds)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# F18: traffic spike (the M1 load test image, in its own container)
+# ---------------------------------------------------------------------------
+# How it works, in short:
+#   * inject runs `docker compose --profile load run -d --no-deps --name sentinelops-chaos-load loadtest`.
+#     The compose command line of the loadtest service reads USERS, SPAWN_RATE and DURATION through ${...},
+#     so they are given in the ENVIRONMENT of the docker compose process (not with `run -e`, which would
+#     only set variables inside the container).
+#   * the container ends by itself when the duration is over. Clear removes it (docker rm -f).
+#   * only a container with this name AND the compose project, service and one-off labels is ever touched.
+
+LOAD_CONTAINER = "sentinelops-chaos-load"
+LOAD_SERVICE = "loadtest"
+PROJECT_NAME = "sentinelops"          # `name:` in docker-compose.yml
+LOAD_START_TIMEOUT_S = 30
+LOAD_STOP_TIMEOUT_S = 30
+LOAD_STARTUP_CHECK_S = 5              # the container must still run this long after it started
+
+
+def load_filters():
+    return ["--filter", f"name=^/{LOAD_CONTAINER}$",
+            "--filter", f"label=com.docker.compose.project={PROJECT_NAME}",
+            "--filter", f"label=com.docker.compose.service={LOAD_SERVICE}",
+            "--filter", "label=com.docker.compose.oneoff=True"]
+
+
+def load_container_ids(dk):
+    return dk.docker("ps", "-a", "-q", *load_filters(), show=False).stdout.split()
+
+
+def load_state(dk):
+    """'running' | 'exited' | 'missing' for the chaos load container."""
+    ids = load_container_ids(dk)
+    if not ids:
+        return "missing"
+    status = dk.docker("inspect", "--format", "{{.State.Status}}", ids[0], show=False).stdout.strip()
+    return "running" if status in ("running", "restarting") else "exited"
+
+
+def load_states(dk, records):
+    """{fault_id: state} for the active F18 records. A failed read is left out: unknown is never reported as stale."""
+    states = {}
+    for record in records:
+        if record["fault_id"] == "F18":
+            try:
+                states["F18"] = load_state(dk)
+            except FaultError:
+                pass
+    return states
+
+
+def load_environment(users, spawn_rate, duration_s):
+    """The variables that the ${...} placeholders of the loadtest service read."""
+    return {"USERS": str(users), "SPAWN_RATE": str(spawn_rate), "DURATION": f"{int(duration_s)}s"}
+
+
+def _remove_load_container(dk):
+    ids = load_container_ids(dk)
+    if not ids:
+        return False
+    dk.docker("rm", "-f", ids[0])
+
+    def check():
+        state = load_state(dk)
+        return (state == "missing", f"the {LOAD_CONTAINER} container still exists ({state})")
+    wait_until(dk, check, f"the {LOAD_CONTAINER} container to be removed", LOAD_STOP_TIMEOUT_S)
+    return True
+
+
+def inject_f18(dk, request):
+    """Traffic spike: more load-test users than the baseline of 20, in a container named sentinelops-chaos-load."""
+    params = request["params"]
+    state = load_state(dk)
+    if state != "missing":
+        raise FaultError(f"a container named {LOAD_CONTAINER} already exists ({state}). "
+                         f"Run first: python chaos/chaos.py clear --all")
+    env = load_environment(params["users"], params["spawn_rate"], request["duration_s"])
+    dk.compose("--profile", "load", "run", "-d", "--no-deps", "--name", LOAD_CONTAINER, LOAD_SERVICE,
+               env=env, timeout=RECREATE_TIMEOUT_S)
+
+    def check():
+        now = load_state(dk)
+        return (now == "running", f"the {LOAD_CONTAINER} container is {now}")
+    wait_until(dk, check, f"the {LOAD_CONTAINER} container to run", LOAD_START_TIMEOUT_S)
+    dk.sleep(LOAD_STARTUP_CHECK_S)
+    if load_state(dk) != "running":
+        raise FaultError(f"the {LOAD_CONTAINER} container stopped right after it started. "
+                         f"See: docker logs --tail 20 {LOAD_CONTAINER}")
+    dk.echo(f"verified: the load container {LOAD_CONTAINER} is running "
+            f"({params['users']} users, {params['spawn_rate']} per s, {int(request['duration_s'])} s)")
+
+
+def clear_f18(dk, record):
+    """Stop and remove the load container. Safe to repeat (nothing to remove is not an error)."""
+    if not _remove_load_container(dk):
+        dk.echo(f"there is no {LOAD_CONTAINER} container: nothing to remove")
+
+
+def sweep_load_container(dk):
+    """For `clear --all`: remove a leftover chaos load container (running or finished). True if one was removed."""
+    return _remove_load_container(dk)
+
+
 # fault id -> (inject function, clear function). A fault that is not in this table is not built yet.
 IMPLEMENTED = {
     "F01": (inject_f01, clear_f01),
@@ -811,8 +1069,10 @@ IMPLEMENTED = {
     "F06": (inject_f06, clear_f06),
     "F08": (inject_f08, clear_f08),
     "F10": (inject_f10, clear_f10),
+    "F11": (inject_f11, clear_f11),
     "F13": (inject_f13, clear_f13),
+    "F18": (inject_f18, clear_f18),
 }
 
-# Which checkpoint builds each missing fault (used in the "not built yet" message and in `list`).
-PLANNED = {"F11": "CP4", "F18": "CP4"}
+# Which checkpoint builds each missing fault (used in the "not built yet" message and in `list`). Empty: all built.
+PLANNED = {}
