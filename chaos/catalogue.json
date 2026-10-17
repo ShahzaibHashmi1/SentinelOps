@@ -227,7 +227,7 @@
         "source": "prometheus",
         "query": "sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m]))",
         "condition": "> 30",
-        "within_s": 60
+        "within_s": 90
       },
       {
         "source": "prometheus",

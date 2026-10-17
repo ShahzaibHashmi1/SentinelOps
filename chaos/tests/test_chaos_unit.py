@@ -400,7 +400,7 @@ class FakeStack:
     def _service_of(self, cid):
         return cid[len("cid-"):]
 
-    LOAD_ID = "loadid" + "0" * 58
+    LOAD_ID = "df5daa603117"       # real docker prints 12-character ids (arguments are shortened only above 60 characters)
 
     def _fault_env(self, service, files):
         """Environment the service gets when compose merges the given -f files (only fault files matter here)."""
@@ -1773,6 +1773,7 @@ class F18Tests(Cp4Base):
 
     def rm_command(self):
         text = faults.display_command(["docker", "rm", "-f", self.stack.LOAD_ID])
+        self.assertEqual(text, "docker rm -f df5daa603117")        # a 12-character id is printed in full
         return "+ " + text
 
     def test_inject_prints_exactly_these_lines_and_passes_the_values_in_the_environment(self):
@@ -1934,10 +1935,101 @@ class ClearAllF11F18Tests(Cp4Base):
         self.assertEqual(self.cli("clear", "--all"), 0)
         self.assertIsNone(self.stack.load)
 
+    def failing_runner(self, matches):
+        """The fake docker, except that every command for which matches(args) is true fails."""
+        original = self.stack.runner
+
+        def runner(args, timeout, env=None):
+            if matches(args):
+                return faults.CmdResult(1, "", "boom: simulated docker failure")
+            return original(args, timeout, env)
+        return runner
+
+    def test_clear_all_removes_the_load_container_even_when_the_f11_check_fails(self):
+        self.stack.load = {"id": self.stack.LOAD_ID, "status": "running", "env": {}}
+        self.ctx.dk.runner = self.failing_runner(lambda args: "exec" in args and "psql" in args)
+        self.assertEqual(self.cli("clear", "--all"), 1)
+        self.assertIsNone(self.stack.load)                                    # the F18 sweep ran anyway
+        self.assertIn("removed the leftover F18 load container sentinelops-chaos-load", self.out)
+        warnings = [line for line in self.out if line.startswith("warning: could not check for leftover F11 sessions")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("boom: simulated docker failure", warnings[0])
+        self.assertFalse(any("F18" in line and line.startswith("warning") for line in self.out))
+        self.assertNotIn("no active faults; the stack is healthy", self.out)   # no false "healthy" claim
+        self.assertTrue(self.out[-1].startswith("warning: the check for a leftover F11 session could not be completed"))
+
+    def test_clear_all_ends_the_f11_session_even_when_the_f18_check_fails(self):
+        self.cli("inject", "F11")
+        self.ctx.state_path.unlink()                                          # a leftover session without a record
+        del self.out[:]
+        self.ctx.dk.runner = self.failing_runner(lambda args: args[:2] == ["docker", "ps"])
+        self.assertEqual(self.cli("clear", "--all"), 1)
+        self.assertEqual(self.stack.sessions, [])                             # the F11 sweep ran anyway
+        self.assertIn("ended 1 leftover F11 session(s) in postgres", self.out)
+        warnings = [line for line in self.out if line.startswith("warning: could not check for a leftover F18")]
+        self.assertEqual(len(warnings), 1)
+        self.assertNotIn("no active faults; the stack is healthy", self.out)
+        self.assertTrue(self.out[-1].startswith("warning: the check for a leftover F18 load container could not be completed"))
+
+    def test_clear_all_names_both_checks_when_both_fail_and_still_finishes_the_recovery(self):
+        self.cli("inject", "F10")
+        del self.out[:]
+        self.ctx.dk.runner = self.failing_runner(
+            lambda args: ("exec" in args and "psql" in args) or args[:2] == ["docker", "ps"])
+        self.assertEqual(self.cli("clear", "--all"), 1)
+        self.assertEqual(len([line for line in self.out if line.startswith("warning: could not check")]), 2)
+        self.assertTrue(self.out[-1].startswith(
+            "warning: the check for a leftover F11 session and a leftover F18 load container could not be completed"))
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["inject", "clear", "recovered"])     # F10 itself was cleared
+        self.assertEqual(chaos.read_state(self.ctx.state_path), {})
+
     def test_clear_all_skips_the_session_check_when_postgres_is_stopped(self):
         self.stack.stopped.add("postgres")
         self.assertEqual(self.cli("clear", "--all"), 0)               # postgres is started by the heal step first
         self.assertEqual(self.stack.stopped, set())
+
+
+class StatusStaleWordingTests(Cp4Base):
+    """The line after the status table says what "stale" means for each stale fault."""
+
+    def stale_lines(self):
+        self.out.clear()
+        self.assertEqual(self.cli("status"), 0)
+        return [line for line in self.out if "is stale:" in line]
+
+    def test_the_generic_line_has_no_fault_specific_wording(self):
+        self.cli("inject", "F11")
+        self.stack.sessions.clear()
+        self.out.clear()
+        self.cli("status")
+        generic = [line for line in self.out if line.startswith("stale = ")]
+        self.assertEqual(generic, ["stale = the effect is gone although the record still exists. "
+                                   "Remove the record with: python chaos/chaos.py clear <ID>"])
+        self.assertNotIn("recreated or restarted", " ".join(self.out))
+
+    def test_f11_and_f18_get_their_own_reason(self):
+        self.cli("inject", "F11")
+        self.cli("inject", "F18")
+        self.stack.sessions.clear()
+        self.stack.load["status"] = "exited"
+        self.assertEqual(self.stale_lines(), [
+            "F11 is stale: no chaos-F11 session is left (duration over, ended by hand, or postgres was restarted)",
+            "F18 is stale: the load container has exited (duration over) or was removed",
+        ])
+
+    def test_only_stale_faults_are_explained(self):
+        self.cli("inject", "F11")
+        self.cli("inject", "F18")
+        self.stack.load["status"] = "exited"                 # F11 stays active
+        self.assertEqual(self.stale_lines(),
+                         ["F18 is stale: the load container has exited (duration over) or was removed"])
+        self.assertRegex("\n".join(self.out), re.compile(r"^F11 .*\bactive\s*$", re.M))      # F11 is still active
+
+    def test_every_fault_of_the_catalogue_has_a_reason(self):
+        self.assertEqual(sorted(chaos.STALE_REASONS), sorted(EXPECTED_IDS))
+        for reason in chaos.STALE_REASONS.values():
+            self.assertTrue(reason and reason[0].islower() and not reason.endswith("."))
 
 
 class RunLifecycleTests(Cp4Base):

@@ -572,6 +572,19 @@ def effect_already_gone(ctx, record):
     return status_of(record, observed) == "stale"
 
 
+# What "stale" means for each fault (printed by `status`; the decision itself is faults.effect_gone).
+STALE_REASONS = {
+    "F01": "its busy-loop processes are gone (duration over, or the container was restarted)",
+    "F02": "its allocator process is gone (duration over, or the container was restarted)",
+    "F06": "the container no longer has the faulted environment (recreated from the base files, or removed)",
+    "F08": "the container no longer has the faulted environment (recreated from the base files, or removed)",
+    "F10": "the container is running again (started by hand or by a restart)",
+    "F13": "the container is running again (started by hand or by a restart)",
+    "F11": "no chaos-F11 session is left (duration over, ended by hand, or postgres was restarted)",
+    "F18": "the load container has exited (duration over) or was removed",
+}
+
+
 def cmd_status(ctx, _args):
     state = read_state(ctx.state_path)
     if not state:
@@ -588,9 +601,12 @@ def cmd_status(ctx, _args):
         status = status_of(record, observed) if observed is not None else "unknown"
         rows.append([fid, record["target"], record["run_id"], age, status])
     ctx.say(format_table(["ID", "Target", "Run id", "Age", "State"], rows))
-    if any(row[4] == "stale" for row in rows):
-        ctx.say("stale = the effect is gone (service recreated or restarted, or the fault's duration is over). "
+    stale = [row[0] for row in rows if row[4] == "stale"]
+    if stale:
+        ctx.say("stale = the effect is gone although the record still exists. "
                 "Remove the record with: python chaos/chaos.py clear <ID>")
+        for fid in stale:                       # one line per stale fault: what "gone" means for that fault
+            ctx.say(f"{fid} is stale: {STALE_REASONS.get(fid, 'its effect is gone')}")
     return 0
 
 
@@ -700,6 +716,7 @@ def cmd_clear(ctx, args):
     state = read_state(ctx.state_path)
     cleared = []
     failed = False
+    unchecked = []          # `--all` sweeps (F11, F18) whose check could not be completed
 
     if args.all:
         records = list(state.values())
@@ -744,18 +761,30 @@ def cmd_clear(ctx, args):
                 ctx.say(f"ended leftover {fid} processes in {target}")
         except FaultError as exc:
             ctx.say(f"warning: could not check for leftover fault processes: {exc}")
+        # F11 and F18 have their own try block each: the F18 sweep needs only docker and must run
+        # even when the F11 check (psql inside postgres) fails, and the other way round.
         try:
             sessions = faults.sweep_lock_sessions(ctx.dk)
             if sessions:
                 ctx.say(f"ended {sessions} leftover F11 session(s) in postgres")
+        except FaultError as exc:
+            unchecked.append("F11 session")
+            ctx.say(f"warning: could not check for leftover F11 sessions: {exc}")
+        try:
             if faults.sweep_load_container(ctx.dk):
                 ctx.say(f"removed the leftover F18 load container {faults.LOAD_CONTAINER}")
         except FaultError as exc:
-            ctx.say(f"warning: could not check for leftover F11/F18 effects: {exc}")
+            unchecked.append("F18 load container")
+            ctx.say(f"warning: could not check for a leftover F18 load container: {exc}")
 
     if failed:
         return 1
     if not finish_recovery(ctx, cleared):
+        return 1
+    if unchecked:
+        # The stack answers, but a leftover effect cannot be ruled out: do not claim "healthy", exit code 1.
+        ctx.say("warning: the check for a leftover " + " and a leftover ".join(unchecked) + " could not be completed "
+                "(see above). Fix the cause and run 'python chaos/chaos.py clear --all' again")
         return 1
     if args.all and not cleared:
         ctx.say("no active faults; the stack is healthy")

@@ -213,3 +213,23 @@ docker compose --profile observability down -v       # deletes the database, met
 ```
 
 Labels, queries, ports, limits, operations and known limitations are documented in [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md). On a host other than Docker Desktop (WSL2) check the cAdvisor containerd socket mount first (see that file, section 7).
+
+## Fault injection (module M3)
+
+Eight faults can be injected into the running stack, and every experiment is written to a ground-truth log: F01 CPU saturation (orders), F02 memory growth (payments), F06 missing environment variable, F08 invalid database credential, F10 PostgreSQL down, F11 lock contention, F13 Redis down, F18 traffic spike. No M1 code changes and no extra container.
+
+### Quick start (PowerShell, repo root)
+
+```powershell
+docker compose --profile observability up -d --build --wait
+python chaos/chaos.py list
+python chaos/chaos.py inject F10          # stops postgres
+python chaos/chaos.py status
+python chaos/chaos.py clear F10           # starts it again and waits until the stack is healthy
+python chaos/chaos.py clear --all         # returns the stack to healthy from any state
+python scripts/chaos_check.py             # verifies all 8 faults (18 min 40 s measured; --quick, --only F10)
+```
+
+`python chaos/chaos.py run F11 --warmup 60 --hold 120 --cooldown 60` does warm-up, inject, hold, clear and cool-down as one labelled experiment. The ground truth is in `chaos/data/ground_truth.jsonl` (git-ignored; delete `chaos/data` before real evaluation runs). Do not run `scripts/smoke_test.py` while a load test or F18 is running.
+
+Catalogue, expected symptoms with their queries, ground-truth format, safety rules, the F18 measurement and known limitations are in [`docs/CHAOS.md`](docs/CHAOS.md).
