@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "R01",
+      "name": "target_down",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "up{job=~\"gateway|orders|payments|inventory\"}",
+      "subject_label": "job",
+      "comparator": "==",
+      "threshold": 0,
+      "for_s": 10,
+      "severity": "high",
+      "role": "root_signal",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 1,
+        "fault_value_min": 0,
+        "margin_ratio": null,
+        "derived_from": "F06 (docs/CHAOS.md section 4, owner's run): min(up) is 0 at every reading from the first on (0 s after the inject). Baseline: up is 1 for every app target. State rule, so the margin rule does not apply and margin_ratio is null."
+      },
+      "description": "A scrape target of an app service is down (up == 0 for 10 s). Root signal: the service named by the job label."
+    },
+    {
+      "id": "R02",
+      "name": "container_missing",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "count by (service) (container_memory_working_set_bytes{service=~\"gateway|orders|payments|inventory|postgres|redis\"})",
+      "subject_label": "service",
+      "comparator": "==",
+      "threshold": 0,
+      "for_s": 10,
+      "severity": "high",
+      "role": "root_signal",
+      "opens_incident": true,
+      "on_missing": "zero",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory",
+        "postgres",
+        "redis"
+      ],
+      "guard": "min(up{job=\"cadvisor\"}) * (count(container_memory_working_set_bytes{service=~\"gateway|orders|payments|inventory|postgres|redis\"}) > bool 0)",
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 1,
+        "fault_value_min": 0,
+        "margin_ratio": null,
+        "derived_from": "F10 (postgres) and F13 (redis), docs/CHAOS.md section 4: the container series count is 0 within 10 s (5 s measured in the owner's runs); series of a stopped container disappear at the next scrape (D29). Baseline: 1 series per container. State rule, so the margin rule does not apply and margin_ratio is null."
+      },
+      "description": "The cAdvisor series of an M1 container are gone (container stopped or removed). A missing subject is evaluated as 0. The guard makes the rule no_data while cAdvisor is down or shows none of the 6 containers."
+    },
+    {
+      "id": "R03",
+      "name": "cpu_high",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "100 * sum by (service) (rate(container_cpu_usage_seconds_total[1m])) / (max by (service) (container_spec_cpu_quota) / max by (service) (container_spec_cpu_period))",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 85,
+      "for_s": 10,
+      "severity": "medium",
+      "role": "root_signal",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory",
+        "postgres",
+        "redis"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 44,
+        "fault_value_min": 90.92,
+        "margin_ratio": 1.932,
+        "derived_from": "F01 (orders): 90.92 % of the CPU limit 45 s after the inject (owner's run). Baselines are 1-minute averages in % of the CPU limit: orders 24.7 (docs/CHAOS.md) and 23.79 (owner's full chaos_check run) at 10 users; orders about 44, gateway about 40, inventory about 30, payments about 20 at 20 users (docs/BASELINE.md correction note, docs/OBSERVABILITY.md section 8). baseline_max 44 (orders, 20 users). Not used: the docker stats snapshot of docs/BASELINE.md section 5. Idle 13 to 15 %. Values above 100 occur."
+      },
+      "description": "CPU use of a container above 85 % of its own CPU limit (1-minute average). The query is the Overview query 'CPU % of limit per container'."
+    },
+    {
+      "id": "R04",
+      "name": "memory_high",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "100 * max by (service) (container_memory_working_set_bytes) / max by (service) (container_spec_memory_limit_bytes)",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 80,
+      "for_s": 10,
+      "severity": "medium",
+      "role": "root_signal",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory",
+        "postgres",
+        "redis"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 29.06,
+        "fault_value_min": 83.54,
+        "margin_ratio": 2.753,
+        "derived_from": "F02 (payments): 83.54 % of the memory limit 35 s after the inject, steady about 86 to 87 (owner's run). Baseline payments 23.9 (docs/CHAOS.md) and 29.06 (owner's full chaos_check run); docs/BASELINE.md section 5 shows no service above about 26 %. baseline_max 29.06."
+      },
+      "description": "Memory working set of a container above 80 % of its memory limit. The query is the Overview query 'memory % of limit' per container."
+    },
+    {
+      "id": "R05",
+      "name": "gateway_5xx_pct",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "label_replace(100 * (sum(rate(http_requests_total{service=\"gateway\",status=~\"5..\",route!~\"/(health|ready|metrics)\"}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), 0.001), \"service\", \"gateway\", \"\", \"\")",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 5,
+      "for_s": 15,
+      "severity": "high",
+      "role": "effect",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway"
+      ],
+      "guard": null,
+      "min_traffic": {
+        "query": "label_replace(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), \"service\", \"gateway\", \"\", \"\")",
+        "min": 0.5,
+        "subject_label": "service"
+      },
+      "provenance": {
+        "baseline_max": 0,
+        "fault_value_min": 6.26,
+        "margin_ratio": null,
+        "derived_from": "Query A of docs/CHAOS.md section 4 (wrapped in label_replace so that the subject is gateway). First readings (owner's runs): F08 6.26 after 0 s, F10 9.19 after 15 s, F11 8.864 after 15 s. Baseline: 0 % (an empty result counts as 0), so margin_ratio is null. The 17.7 % read right after an F06 recreate is the previous minute and is not a baseline (docs/CHAOS.md notes). Rate guard: evaluated only at 0.5 requests/s or more."
+      },
+      "description": "Share of gateway requests answered with 5xx above 5 % for 15 s (1-minute window), only while the gateway receives at least 0.5 requests per second."
+    },
+    {
+      "id": "R06",
+      "name": "dependency_errors",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "sum by (job, dependency) (rate(dependency_requests_total{job=~\"gateway|orders|payments|inventory\",outcome!=\"success\"}[1m]))",
+      "subject_label": "job",
+      "comparator": ">",
+      "threshold": 0.1,
+      "for_s": 10,
+      "severity": "medium",
+      "role": "dependency_effect",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 0,
+        "fault_value_min": 0.18,
+        "margin_ratio": null,
+        "derived_from": "dependency_requests_total with outcome other than success, errors per second (docs/CHAOS.md section 4). First readings (owner's runs): F08 orders 0.18 per s after 5 s, F13 0.50 per s after 10 s. Baseline: empty (counted as 0), so margin_ratio is null. The dependency goes into the symptom detail as dependency=<name>."
+      },
+      "description": "A service sees more than 0.1 failed dependency calls per second for 10 s. The subject is the calling service (job); the failing dependency is named in the detail."
+    },
+    {
+      "id": "R07",
+      "name": "latency_p95",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket{route!~\"/(health|ready|metrics)\"}[1m])))",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 0.5,
+      "for_s": 15,
+      "severity": "medium",
+      "role": "effect",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory"
+      ],
+      "guard": null,
+      "min_traffic": {
+        "query": "sum by (service) (rate(http_request_duration_seconds_count{route!~\"/(health|ready|metrics)\"}[1m]))",
+        "min": 1,
+        "subject_label": "service"
+      },
+      "provenance": {
+        "baseline_max": 0.203,
+        "fault_value_min": 0.955,
+        "margin_ratio": 2.463,
+        "derived_from": "p95 per app service, 1-minute window, health, ready and metrics routes excluded. First readings (owner's runs): F18 gateway 0.955 s after 0 s, F11 inventory 1.507 s after 15 s. Baselines: gateway p95 0.1 to 0.2 s (docs/CHAOS.md) and about 203 ms on the dashboard at 20 users (docs/OBSERVABILITY.md section 8); inventory 0.01 s. baseline_max 0.203. Rate guard: evaluated only at 1 request/s or more per service."
+      },
+      "description": "p95 request latency of an app service above 0.5 s for 15 s, only while that service receives at least 1 request per second."
+    },
+    {
+      "id": "R08",
+      "name": "throughput_surge",
+      "detector": "threshold",
+      "source": "prometheus",
+      "query": "label_replace(sum(rate(http_requests_total{service=\"gateway\",route!~\"/(health|ready|metrics)\"}[1m])), \"service\", \"gateway\", \"\", \"\")",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 30,
+      "for_s": 15,
+      "severity": "medium",
+      "role": "load",
+      "opens_incident": true,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": 18.97,
+        "fault_value_min": 31.77,
+        "margin_ratio": 1.581,
+        "derived_from": "F18 query of docs/CHAOS.md section 4 (wrapped in label_replace so that the subject is gateway). F18 first reading above the threshold: 31.77 requests/s after 50 s (owner's full chaos_check run with a 10-user background load), plateau about 38. Baseline: 18.97 requests/s at 20 users (docs/BASELINE.md). baseline_max 18.97; 1.5 x 18.97 = 28.46."
+      },
+      "description": "Gateway requests per second above 30 for 15 s (the 20-user baseline is about 19). Role load: a surge is a capacity problem, so the incident has no single root service."
+    },
+    {
+      "id": "R09",
+      "name": "log_errors",
+      "detector": "threshold",
+      "source": "loki",
+      "query": "sum by (service) (count_over_time({service=~\"gateway|orders|payments|inventory\", level=~\"WARNING|ERROR\"}[1m]))",
+      "subject_label": "service",
+      "comparator": ">",
+      "threshold": 0,
+      "for_s": 10,
+      "severity": "low",
+      "role": "evidence",
+      "opens_incident": false,
+      "on_missing": "ok",
+      "expected_subjects": [
+        "gateway",
+        "orders",
+        "payments",
+        "inventory"
+      ],
+      "guard": null,
+      "min_traffic": null,
+      "provenance": {
+        "baseline_max": null,
+        "fault_value_min": null,
+        "margin_ratio": null,
+        "derived_from": "PENDING: the Loki baseline (WARNING and ERROR lines per service and minute, idle and with 10 users) has not been measured yet, so threshold 0 is provisional. Rule to apply: threshold >= 3 x the highest per-minute count seen. M3 evidence from other queries (2-minute windows, other filters): F06 2 lines, F08 12, F10 4, F13 1."
+      },
+      "description": "WARNING and ERROR log lines of an app service in the last minute. Evidence only: it is attached to an open incident and never opens one (Loki is the weaker and later source)."
+    }
+  ]
+}
