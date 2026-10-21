@@ -187,7 +187,7 @@ docker compose --profile observability up -d --build --wait
 python scripts/observability_check.py
 ```
 
-`docker compose ps` should list 11 containers (6 M1 + prometheus, cadvisor, loki, alloy, grafana). `loki` and `alloy` have no healthcheck and show `Up` without `(healthy)`. Wait about 90 seconds before judging rates on the dashboards.
+`docker compose ps` should list 11 containers (6 M1 + prometheus, cadvisor, loki, alloy, grafana). "11" means without the detector profile: the incident detector (module M4) is a 12th container in its own compose profile, and with `docker compose --profile observability --profile detector up -d --build --wait` the command `docker compose ps -q` lists 12 containers. `loki` and `alloy` have no healthcheck and show `Up` without `(healthy)`. Wait about 90 seconds before judging rates on the dashboards.
 
 ### Where to look
 
@@ -198,6 +198,7 @@ python scripts/observability_check.py
 | Dashboard: SentinelOps Service Detail (choose the service at the top; paste a request id to filter the logs) | http://127.0.0.1:3000/d/sentinelops-service-detail |
 | Prometheus (targets: `/targets`) | http://127.0.0.1:9090 |
 | Loki readiness | http://127.0.0.1:3100/ready |
+| Detector status (only with `--profile detector`) | http://127.0.0.1:9100/internal/v1/status |
 
 ### Generate load and see it
 

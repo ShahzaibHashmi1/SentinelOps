@@ -454,11 +454,58 @@ services:
       sentinelops.tier: observability
     networks: [sentinelops]
 
+  # ---- incident detector (module M4), only started with --profile detector ----
+  # Start with Prometheus and Loki: docker compose --profile observability --profile detector up -d --build --wait   (12 containers)
+  # Start only the detector:        docker compose --profile detector up -d --build --wait detector   (valid: both sources then show no_data)
+  # Reads ONLY Prometheus (http://prometheus:9090) and Loki (http://loki:3100) over HTTP: no connection to the app services or their
+  # databases, no Docker socket, and deliberately NO depends_on, so it keeps recording while any of them is down or not started.
+  # Incidents live in SQLite in the named volume detector-data (WAL mode, one writer); "docker compose down -v" deletes it.
+  # The optional DETECTOR_* variables below are not in .env.example; the defaults are the ones of the detector itself.
+  detector:
+    profiles: ["detector"]
+    build:
+      context: .   # repository root, like the M1 Dockerfiles
+      dockerfile: detector/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-1.0.0}
+    image: sentinelops/detector:${APP_VERSION:-1.0.0}
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PROMETHEUS_URL: http://prometheus:9090
+      LOKI_URL: http://loki:3100
+      EVAL_INTERVAL_S: ${DETECTOR_EVAL_INTERVAL_S:-5}
+      WARMUP_S: ${DETECTOR_WARMUP_S:-30}
+      RESOLVE_AFTER_S: ${DETECTOR_RESOLVE_AFTER_S:-60}
+      REOPEN_WITHIN_S: ${DETECTOR_REOPEN_WITHIN_S:-120}
+      DB_PATH: /data/detector.db
+    ports:
+      - "127.0.0.1:9100:9100"   # localhost only
+    volumes:
+      - detector-data:/data   # named volume (no Windows bind mount); /data is owned by uid 10001 in the image
+    # Liveness only (/health): a source in no_data must not make the container "unhealthy". The image has no wget or curl.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    labels:
+      sentinelops.service: detector
+      sentinelops.tier: observability
+    networks: [sentinelops]
+
 volumes:
   pgdata:
   prometheus-data:
   loki-data:
   grafana-data:
+  detector-data:
 
 networks:
   sentinelops:

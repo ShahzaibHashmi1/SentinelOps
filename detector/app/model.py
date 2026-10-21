@@ -42,7 +42,11 @@ def iso_z(dt: datetime) -> str:
 
 
 def parse_iso(text: str) -> datetime:
-    return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    """ISO 8601 text -> aware UTC datetime. A time without a zone is taken as UTC (never as local time)."""
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 # ----------------------------------------------------------------- observation

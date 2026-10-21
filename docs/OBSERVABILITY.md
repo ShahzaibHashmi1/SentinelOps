@@ -1,7 +1,7 @@
 # SentinelOps observability (module M2)
 
 **Status:** M2 complete: `scripts/observability_check.py` passes (29/29) and Definition of Done 1 to 9 are verified on the owner's Docker Desktop (see section 9).
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-20
 
 This file is the **contract** that later modules rely on: M4 (detection) and M12 (evaluation) query Prometheus, M5 (evidence builder) queries Loki, M10 (SentinelOps dashboard) reuses the queries in section 4. Do not change a label name or a service value without updating this file and the dashboards.
 
@@ -10,12 +10,13 @@ This file is the **contract** that later modules rely on: M4 (detection) and M12
 | Task | Command (PowerShell, repo root) |
 |------|--------------------------------|
 | Start M1 only (6 containers) | `docker compose up -d --build --wait` |
-| Start M1 + observability (11 containers) | `docker compose --profile observability up -d --build --wait` |
+| Start M1 + observability (11 containers, without the detector profile) | `docker compose --profile observability up -d --build --wait` |
+| Start M1 + observability + incident detector (12 containers) | `docker compose --profile observability --profile detector up -d --build --wait` |
 | Stop (data kept) | `docker compose --profile observability down` |
 | Stop and delete ALL data | `docker compose --profile observability down -v` |
 | Verify the stack | `python scripts/observability_check.py` |
 
-`docker compose down -v` deletes the named volumes `pgdata` (shop database), `prometheus-data` (7 days of metrics), `loki-data` (7 days of logs) and `grafana-data` (Grafana database and admin password). Without `--profile observability`, `down` leaves the observability containers running if they were started with the profile.
+`docker compose down -v` deletes the named volumes `pgdata` (shop database), `prometheus-data` (7 days of metrics), `loki-data` (7 days of logs) and `grafana-data` (Grafana database and admin password). Without `--profile observability`, `down` leaves the observability containers running if they were started with the profile. The same holds for the detector container (module M4) and `--profile detector`; its database lives in the named volume `detector-data`, which `docker compose --profile detector down -v` deletes as well.
 
 `loki` and `alloy` have no Compose healthcheck (their images contain no shell, wget or curl), so `docker compose ps` shows them as `Up` without `(healthy)`, and `--wait` only waits for them to be running. Loki needs about 15 s after start until `/ready` returns 200.
 
@@ -28,6 +29,7 @@ This file is the **contract** that later modules rely on: M4 (detection) and M12
 | alloy | `grafana/alloy:v1.20.1` | http://127.0.0.1:12345 (override file only) | http://alloy:12345 | 0.25 CPU / 256m | none |
 | cadvisor | `ghcr.io/google/cadvisor:v0.60.6` | http://127.0.0.1:8081 (override file only) | http://cadvisor:8080 | 0.25 CPU / 256m | wget `/healthz` |
 | grafana | `grafana/grafana:13.2.3` | http://127.0.0.1:3000 | http://grafana:3000 | 0.5 CPU / 512m | curl `/api/health` |
+| detector (module M4, profile `detector`, not counted in the 11) | built from `detector/Dockerfile` (`python:3.12-slim`) | http://127.0.0.1:9100 | http://detector:9100 | 0.25 CPU / 128m | python urllib `/health` |
 
 M1 services inside the network: `gateway:8000` (also published on 127.0.0.1:8000), `orders:8001`, `payments:8002`, `inventory:8003`, `postgres:5432`, `redis:6379`. The override file `docker-compose.override.yml` also publishes orders, payments and inventory on 127.0.0.1 for debugging. All new containers carry the labels `sentinelops.service=<name>` and `sentinelops.tier=observability`. No new container sends telemetry to the internet (Grafana usage reporting, update checks, news feed and plugin preinstall are off; Alloy runs with `--disable-reporting`; Loki usage reporting is off).
 
@@ -391,6 +393,8 @@ Display rules: a value that does not exist is shown as `-` (p95 without traffic,
 3. Reload: `docker compose --profile observability kill -s SIGHUP prometheus` (decision D26: no `--web.enable-lifecycle`, no HTTP reload).
 4. Check: `docker compose --profile observability logs --tail 5 prometheus` shows "Completed loading of configuration file", and http://127.0.0.1:9090/targets lists the job as UP.
 5. Add the job name to `APP_TARGETS` in `scripts/observability_check.py` if it must be checked.
+
+Since module M4 the detector is a real target: `observability/prometheus/prometheus.yml` has the job `detector` (target `detector:9100`, no `service` label). It is up only while the compose profile `detector` runs; without that profile the target is simply down. `scripts/observability_check.py` checks the five targets gateway, orders, payments, inventory and cadvisor and is not affected. Prometheus and cAdvisor still see exactly the 6 M1 containers, and Alloy still collects only M1 logs (the detector carries the label `sentinelops.tier=observability`).
 
 ### 6.2 Reload or restart after a config change
 

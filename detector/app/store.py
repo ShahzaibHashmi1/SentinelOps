@@ -5,7 +5,7 @@ transaction. The API threads never use it; they open a StoreReader (read-only co
 request). "Single writer" is by design, not by a lock: a reader connection is opened with
 mode=ro and cannot write at all.
 
-The database lives in a NAMED Docker volume mounted at /data (no Windows bind mount), journal
+The database lives in a NAMED volume mounted at /data (no Windows bind mount), journal
 mode WAL. Not in the monitored postgres: F10 and F11 break that database and the incidents
 describing them must still be written.
 """

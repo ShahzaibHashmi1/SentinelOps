@@ -63,6 +63,13 @@ scrape_configs:
         replacement: "$1"
         action: replace
 
+  # Incident detector (module M4). Only up while the compose profile "detector" runs; otherwise this target is simply down.
+  # The job name is the container name; no label called "service" (see the gotcha above).
+  - job_name: detector
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["detector:9100"]
+
   # Prometheus monitors itself (its own scrape health, TSDB size, ...).
   - job_name: prometheus
     static_configs:

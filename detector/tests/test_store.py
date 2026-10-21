@@ -1,7 +1,9 @@
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -34,6 +36,28 @@ def build_incident():
     d.step(d.obs("A", "postgres", "firing", value=0.0, comparator="==", threshold=0.0),
            d.obs("L", "orders", "no_data", source="loki"))
     return d
+
+
+class ParseIsoTests(unittest.TestCase):
+    def test_a_time_without_a_zone_is_utc_whatever_the_machine_zone_is(self):
+        from datetime import datetime, timezone
+        from app.model import parse_iso
+        expected = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(parse_iso("2026-10-18T12:00:00"), expected)
+        self.assertEqual(parse_iso("2026-10-18T12:00:00Z"), expected)
+        self.assertEqual(parse_iso("2026-10-18T17:00:00+05:00"), expected)
+        if hasattr(time, "tzset"):                              # POSIX: pretend the machine runs on Pakistan time
+            old = os.environ.get("TZ")
+            os.environ["TZ"] = "PKT-5"
+            time.tzset()
+            try:
+                self.assertEqual(parse_iso("2026-10-18T12:00:00"), expected)
+            finally:
+                if old is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = old
+                time.tzset()
 
 
 class StoreTests(unittest.TestCase):

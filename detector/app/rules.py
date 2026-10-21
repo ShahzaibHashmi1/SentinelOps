@@ -58,7 +58,7 @@ class Provenance:
 @dataclass(frozen=True)
 class MinTraffic:
     """Rate guard: the rule is evaluated only while the traffic query is at least `min`;
-    below that the observation is "ok" (one failed request at 0.2 requests/s would read 100 %)."""
+    below that the observation is "ok" (one failed call at 0.2 calls/s would read 100 %)."""
     query: str
     min: float
     subject_label: Optional[str]
