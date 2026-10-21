@@ -191,6 +191,7 @@ class FileLoadingTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(rules_module.main([str(RULES_JSON)]), 0)
         self.assertIn("9 rules valid", out.getvalue())
+        self.assertTrue(out.getvalue().rstrip().endswith("pending provenance: none"))
 
 
 class ShippedRulesTests(unittest.TestCase):
@@ -239,7 +240,11 @@ class ShippedRulesTests(unittest.TestCase):
     def test_margin_rule_numbers_of_the_prompt(self):
         r = self.by_id
         self.assertEqual((r["R03"].provenance.baseline_max, r["R03"].provenance.fault_value_min), (44, 90.92))
-        self.assertEqual((r["R04"].provenance.baseline_max, r["R04"].provenance.fault_value_min), (29.06, 83.54))
+        self.assertEqual((r["R04"].provenance.baseline_max, r["R04"].provenance.fault_value_min), (33.4, 83.54))
+        self.assertEqual(r["R04"].provenance.margin_ratio, 2.395)
+        self.assertEqual((r["R09"].provenance.baseline_max, r["R09"].provenance.fault_value_min), (0, 1))
+        self.assertEqual(r["R09"].threshold, 0)
+        self.assertIsNone(r["R09"].provenance.margin_ratio)
         self.assertEqual((r["R08"].provenance.baseline_max, r["R08"].provenance.fault_value_min), (18.97, 31.77))
         self.assertEqual(r["R06"].provenance.fault_value_min, 0.18)
         self.assertEqual(r["R05"].provenance.fault_value_min, 6.26)
@@ -251,18 +256,23 @@ class ShippedRulesTests(unittest.TestCase):
                 self.assertGreaterEqual(rule.threshold + 1e-9, 1.5 * p.baseline_max, rule.id)
                 self.assertLessEqual(rule.threshold, p.fault_value_min + 1e-9, rule.id)
 
-    def test_only_r09_has_pending_provenance(self):
-        self.assertEqual([r.id for r in self.rules if r.provenance.pending], ["R09"])
+    def test_no_rule_has_pending_provenance(self):
+        """R09 was PENDING in CP1; its Loki baseline is measured now (0 lines), so nothing is pending."""
+        self.assertEqual([r.id for r in self.rules if r.provenance.pending], [])
         for rule in self.rules:
-            if not rule.provenance.pending:
-                self.assertIsNotNone(rule.provenance.baseline_max, rule.id)
-                self.assertIsNotNone(rule.provenance.fault_value_min, rule.id)
+            self.assertIsNotNone(rule.provenance.baseline_max, rule.id)
+            self.assertIsNotNone(rule.provenance.fault_value_min, rule.id)
+
+    def test_r09_provenance_says_where_the_fault_value_comes_from(self):
+        text = self.by_id["R09"].provenance.derived_from
+        self.assertFalse(text.startswith("PENDING"))
+        self.assertIn("DIFFERENT query", text)       # fault_value_min 1 is F13 evidence of another query
 
     def test_provenance_table_lists_every_rule(self):
         text = provenance_table(self.rules)
         for rule in self.rules:
             self.assertIn(rule.id, text)
-        self.assertIn("PENDING", text)
+        self.assertNotIn("PENDING", text)
 
     def test_no_query_uses_a_service_label_on_the_scrape_job_or_the_detectors_own_metrics(self):
         for rule in self.rules:

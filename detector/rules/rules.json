@@ -120,10 +120,10 @@
       "guard": null,
       "min_traffic": null,
       "provenance": {
-        "baseline_max": 29.06,
+        "baseline_max": 33.4,
         "fault_value_min": 83.54,
-        "margin_ratio": 2.753,
-        "derived_from": "F02 (payments): 83.54 % of the memory limit 35 s after the inject, steady about 86 to 87 (owner's run). Baseline payments 23.9 (docs/CHAOS.md) and 29.06 (owner's full chaos_check run); docs/BASELINE.md section 5 shows no service above about 26 %. baseline_max 29.06."
+        "margin_ratio": 2.395,
+        "derived_from": "F02 (payments): 83.54 % of the memory limit 35 s after the inject, steady about 86 to 87 (owner's run). Baselines: payments 23.9 (docs/CHAOS.md) and 29.06 (owner's full chaos_check run); highest value of the owner's M4 CP1 measurement (Prometheus max_over_time over 16 minutes at 15 s steps: 10 idle minutes, then 6 minutes with 10 users): payments 33.4 (inventory 27.9, orders 28.0, gateway 23.5, postgres 11.2, redis 6.7). baseline_max 33.4; 1.5 x 33.4 = 50.1."
       },
       "description": "Memory working set of a container above 80 % of its memory limit. The query is the Overview query 'memory % of limit' per container."
     },
@@ -272,10 +272,10 @@
       "guard": null,
       "min_traffic": null,
       "provenance": {
-        "baseline_max": null,
-        "fault_value_min": null,
+        "baseline_max": 0,
+        "fault_value_min": 1,
         "margin_ratio": null,
-        "derived_from": "PENDING: the Loki baseline (WARNING and ERROR lines per service and minute, idle and with 10 users) has not been measured yet, so threshold 0 is provisional. Rule to apply: threshold >= 3 x the highest per-minute count seen. M3 evidence from other queries (2-minute windows, other filters): F06 2 lines, F08 12, F10 4, F13 1."
+        "derived_from": "Baseline measured by the owner (M4 CP1, Loki query_range, 1-minute counts of WARNING and ERROR lines per service: 10 idle minutes, then 6 minutes with 10 users): no such line at all, so baseline_max is 0 and 3 x 0 = 0; margin_ratio is null because the baseline is 0. fault_value_min 1 is the F13 first reading of the M3 evidence (1 line after 0 s). It comes from a DIFFERENT query (a 2-minute window filtered on the text redis, not on the level), so it is an upper bound for the threshold and not a reading of this query; the other M3 readings (F06 2, F08 12, F10 4) are from other queries too. Threshold 0 means at least one WARNING or ERROR line in the last minute."
       },
       "description": "WARNING and ERROR log lines of an app service in the last minute. Evidence only: it is attached to an open incident and never opens one (Loki is the weaker and later source)."
     }

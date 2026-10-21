@@ -82,7 +82,7 @@ class BaselineTests(unittest.TestCase):
     def test_ten_minutes_of_normal_load_raise_nothing(self):
         h = Harness()
         h.set("R03", by("service", {"gateway": 40, "orders": 44, "inventory": 30, "payments": 20, "postgres": 6, "redis": 3}))
-        h.set("R04", by("service", {**{s: 26 for s in ALL6}, "payments": 29.06}))
+        h.set("R04", by("service", {**{s: 26 for s in ALL6}, "payments": 33.4}))
         h.set("R07", by("service", {"gateway": 0.203, "orders": 0.18, "payments": 0.1, "inventory": 0.01}), traffic=ALL_TRAFFIC)
         h.set("R08", by("service", {"gateway": 18.97}))
         h.run(600)
