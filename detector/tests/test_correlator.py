@@ -474,6 +474,36 @@ class DerivedFieldTests(unittest.TestCase):
                            ("LD", "e", "firing", {"value": 1.0})], n=4)
         self.assertTrue(d2.incident.title.endswith(" and 2 more"), d2.incident.title)
 
+    def test_the_title_names_the_symptoms_that_open_incidents_not_the_evidence(self):
+        d = driver()
+        # log evidence L is the first one to fire (t=0), the opening rules A and B follow (t=5 and t=10)
+        d.step(d.obs("L", "gateway", "firing", value=3.0, source="loki"))
+        d.step(d.obs("L", "gateway", "firing", value=3.0, source="loki"), d.obs("A", "postgres", "firing", value=0.0))
+        for _ in range(6):
+            d.step(d.obs("L", "gateway", "firing", value=3.0, source="loki"), d.obs("L", "inventory", "firing", value=3.0, source="loki"),
+                   d.obs("A", "postgres", "firing", value=0.0), d.obs("B", "gateway", "firing", value=9.0))
+        inc = d.incident
+        self.assertEqual({s.rule_id for s in inc.symptoms}, {"A", "B", "L"})
+        self.assertEqual(inc.title, "alpha postgres, bravo gateway")
+        self.assertNotIn("logs", inc.title)
+
+    def test_the_title_counts_only_the_opening_symptoms_in_and_N_more(self):
+        d = driver()
+        for _ in range(4):
+            d.step(d.obs("A", "a", "firing", value=1.0), d.obs("A2", "b", "firing", value=1.0), d.obs("B", "c", "firing", value=1.0),
+                   d.obs("D", "d", "firing", value=1.0), d.obs("L", "a", "firing", value=1.0, source="loki"),
+                   d.obs("L", "b", "firing", value=1.0, source="loki"), d.obs("L", "c", "firing", value=1.0, source="loki"))
+        self.assertEqual(d.incident.title, "alpha a, alpha_two b, bravo c and 1 more")
+
+    def test_a_title_without_any_opening_symptom_falls_back_to_all_symptoms(self):
+        d = driver()
+        for _ in range(3):
+            d.step(d.obs("A", "x", "firing", value=1.0))
+        evidence_only = [s for s in d.incident.symptoms]
+        for s in evidence_only:
+            s.opens_incident = False
+        self.assertEqual(d.correlator._title(evidence_only), "alpha x")
+
     def test_updated_at_follows_the_last_change(self):
         d = driver()
         fire(d, 3)

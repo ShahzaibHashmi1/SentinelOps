@@ -74,7 +74,10 @@ class ApiFixture:
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as r:
                 return r.status, dict(r.headers), r.read()
         except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
+            try:
+                return e.code, dict(e.headers), e.read()
+            finally:
+                e.close()                      # an HTTPError holds the socket: close it (ResourceWarning otherwise)
 
     def json(self, path):
         status, headers, body = self.get(path)
@@ -283,6 +286,26 @@ class IncidentTests(ApiTestCase):
                 self.assertEqual(headers["Allow"], "GET")
                 if method != "HEAD":
                     self.assertEqual(json.loads(body)["error"]["code"], "method_not_allowed")
+
+    def test_a_large_request_body_still_gets_the_405_answer(self):
+        # The server must read and drop the body; otherwise it closes with unread data and the client sees a reset.
+        for _ in range(5):
+            conn = http.client.HTTPConnection("127.0.0.1", self.fx.port, timeout=10)
+            conn.request("POST", "/internal/v1/incidents", body=b"x" * (600 * 1024))
+            r = conn.getresponse()
+            self.assertEqual((r.status, r.getheader("Allow")), (405, "GET"))
+            r.read()
+            conn.close()
+
+    def test_a_wrong_content_length_does_not_break_the_answer(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.fx.port, timeout=10)
+        conn.putrequest("POST", "/health")
+        conn.putheader("Content-Length", "not-a-number")
+        conn.endheaders()
+        r = conn.getresponse()
+        self.assertEqual(r.status, 405)
+        r.read()
+        conn.close()
 
     def test_no_write_reaches_the_store_through_the_api(self):
         before = self.fx.json("/internal/v1/incidents")[2]

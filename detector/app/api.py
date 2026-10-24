@@ -212,13 +212,32 @@ def dispatch(ctx: ApiContext, method: str, target: str) -> tuple:
 
 # --------------------------------------------------------------------- server
 
+_MAX_DRAIN_BYTES = 1 << 20      # a request body is read and dropped up to this size
+
+
 class DetectorHandler(BaseHTTPRequestHandler):
     server_version = "sentinelops-detector"
     sys_version = ""
+    timeout = 10                # a client that announces a body and never sends it must not hold a thread for ever
+
+    def _drain_body(self) -> None:
+        """Read and drop the request body before answering. The API accepts no body (every route but GET is a 405),
+        but a server that closes the connection with unread data makes the client see a connection reset instead of
+        the answer; on Windows this showed up as WinError 10053 in a test."""
+        try:
+            remaining = min(int(self.headers.get("Content-Length") or 0), _MAX_DRAIN_BYTES)
+        except ValueError:
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                return
+            remaining -= len(chunk)
 
     def _serve(self) -> None:
         started = time.monotonic()
         ctx: ApiContext = self.server.ctx
+        self._drain_body()
         status, content_type, body, headers = dispatch(ctx, self.command, self.path)
         self.send_response(status)
         self.send_header("Content-Type", content_type)

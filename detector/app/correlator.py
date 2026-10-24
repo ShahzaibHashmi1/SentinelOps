@@ -320,8 +320,11 @@ class Correlator:
         return None
 
     def _title(self, symptoms: list) -> str:
+        """The first three (rule, service) pairs by first_seen. Evidence symptoms (opens_incident false, for example log
+        lines) are left out, so that the title names what opened the incident; if there is no other symptom, they are used."""
+        openers = [s for s in symptoms if s.opens_incident]
         labels: list = []
-        for symptom in sorted(symptoms, key=lambda s: (s.first_seen, s.rule_id, s.service or "")):
+        for symptom in sorted(openers or symptoms, key=lambda s: (s.first_seen, s.rule_id, s.service or "")):
             name = self._metas[symptom.rule_id].name if symptom.rule_id in self._metas else symptom.rule_id
             label = f"{name} {symptom.service}" if symptom.service else name
             if label not in labels:
