@@ -405,16 +405,24 @@ class ComposeProfileTests(unittest.TestCase):
         self.assertEqual(cmd[len(self.BASE):len(self.BASE) + 4], ["--profile", "observability", "--profile", "detector"])
 
     def test_the_script_only_uses_compose_verbs_that_are_not_faults(self):
-        """Faults go through chaos.py only. Docker compose calls in the script are ps, stop, up (and the load run)."""
+        """Faults go through chaos.py only. Docker compose calls in the script are ps, stop, up (and the load run); `restart`
+        exists once, for the detector in the persistence step."""
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
         verbs = set()
+        restart_calls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("compose", "compose_service"):
-                for arg in node.args:
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        verbs.add(arg.value)
-        self.assertTrue({"ps", "stop", "up"} <= verbs, verbs)
-        self.assertFalse(verbs & {"kill", "pause", "unpause", "restart", "rm", "exec", "down", "network", "run"}, verbs)
+                constants = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                verbs.update(constants)
+                if "restart" in constants:
+                    restart_calls.append(node)
+        self.assertTrue({"ps", "stop", "up", "restart"} <= verbs, verbs)
+        self.assertFalse(verbs & {"kill", "pause", "unpause", "rm", "exec", "down", "network", "run"}, verbs)
+        self.assertEqual(len(restart_calls), 1)
+        call = restart_calls[0]
+        self.assertEqual(call.func.id, "compose_service")                         # carries the profile of its service
+        self.assertIsInstance(call.args[0], ast.Name)
+        self.assertEqual(call.args[0].id, "DETECTOR_SERVICE")                    # only the detector is ever restarted
 
     def test_every_compose_service_call_names_a_service_with_a_known_profile(self):
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
@@ -435,7 +443,17 @@ class ExpectationTests(unittest.TestCase):
                                                   "primary": "redis", "limit_s": 50})
         self.assertEqual(dc.EXPECTATIONS["F06"], {"target": "inventory", "rules": [("R01", "inventory")],
                                                   "primary": "inventory", "limit_s": 50})
-        self.assertEqual(dc.FAULT_ORDER, ["F10", "F13", "F06"])
+        self.assertEqual(dc.EXPECTATIONS["F01"], {"target": "orders", "rules": [("R03", "orders")], "primary": "orders", "limit_s": 110})
+        self.assertEqual(dc.EXPECTATIONS["F02"], {"target": "payments", "rules": [("R04", "payments")], "primary": "payments", "limit_s": 140})
+        self.assertEqual(dc.EXPECTATIONS["F08"], {"target": "orders", "rules": [("R06", None), ("R05", None)], "primary": None, "limit_s": 80})
+        self.assertEqual(dc.EXPECTATIONS["F11"], {"target": "postgres", "rules": [("R07", "inventory"), ("R05", None)],
+                                                  "primary": None, "limit_s": 110})
+        self.assertEqual(dc.EXPECTATIONS["F18"], {"target": "gateway", "rules": [("R08", "gateway"), ("R07", "gateway")], "primary": None,
+                                                  "limit_s": 110, "min_rules": 2, "candidates": ["gateway"]})
+        self.assertEqual(dc.FAULT_ORDER, ["F10", "F13", "F06", "F01", "F02", "F08", "F11", "F18"])
+        self.assertEqual(sorted(dc.EXPECTATIONS), sorted(dc.FAULT_ORDER))
+        self.assertEqual(dc.PERSISTENCE_FAULT, "F13")
+        self.assertEqual(dc.PRIMARY_NULL_BY_DESIGN, ("F08", "F11", "F18"))
 
     def test_the_expected_rules_exist_and_can_name_that_service(self):
         rules = {r["id"]: r for r in json.loads(RULES_JSON.read_text(encoding="utf-8"))["rules"]}
@@ -451,7 +469,10 @@ class ExpectationTests(unittest.TestCase):
         for fid, exp in dc.EXPECTATIONS.items():
             self.assertEqual(catalogue[fid]["default_target"], exp["target"], fid)
             cause = catalogue[fid]["expected_root_cause"]["service"]
-            self.assertEqual(exp["primary"], exp["target"] if cause == "$target" else cause, fid)
+            if fid in dc.PRIMARY_NULL_BY_DESIGN:        # D61: the detector names no root service where several services show symptoms
+                self.assertIsNone(exp["primary"], fid)
+            else:
+                self.assertEqual(exp["primary"], exp["target"] if cause == "$target" else cause, fid)
 
     def test_final_table(self):
         rows = [{"fault": "F10", "limit_s": 50, "ok": True, "incident_id": "INC-0002", "delay_s": 12.34, "resolve_s": 70.0,
@@ -536,7 +557,288 @@ class SummaryTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(dc.main(["--only", "F99"]), 2)
         self.assertIn("F99", err.getvalue())
-        self.assertIn("F10, F13, F06", err.getvalue())
+        self.assertIn("F10, F13, F06, F01, F02, F08, F11, F18", err.getvalue())
+
+
+# ----------------------------------------------------------------------------- CP4 helpers
+
+F18 = dc.EXPECTATIONS["F18"]
+FOR_S = {"R03": 10.0, "R07": 15.0, "R08": 15.0, "R05": 15.0, "R02": 10.0}
+
+
+def surge_incident(r07=3.0, r08=50.0, r03=52.0, candidates=("gateway",), primary=None, extra=None, opened_offset=20.0):
+    """An F18-shaped incident: R07 on the gateway is seen first, R08 and R03 join later. Offsets are seconds after REFERENCE."""
+    syms = [symptom("R07", "gateway", first=REFERENCE + timedelta(seconds=r07)),
+            symptom("R08", "gateway", first=REFERENCE + timedelta(seconds=r08)),
+            symptom("R03", "gateway", first=REFERENCE + timedelta(seconds=r03))] + (extra or [])
+    return incident(opened=REFERENCE + timedelta(seconds=opened_offset), symptoms=syms, primary=primary,
+                    resolved=RECOVERED + timedelta(seconds=100))
+
+
+class ShapeTestTests(unittest.TestCase):
+    """F18: one incident, several symptoms, no root service, the gateway among the candidates."""
+
+    def checks(self, inc):
+        return {name: (ok, detail) for name, ok, detail in dc.incident_checks(inc, F18, REFERENCE, T0, RECOVERED)}
+
+    def test_a_good_f18_incident(self):
+        inc = surge_incident()
+        names = [c[0] for c in dc.incident_checks(inc, F18, REFERENCE, T0, RECOVERED)]
+        self.assertEqual(names, ["opened within 110 s of the end of the inject",
+                                 "the symptoms include R08 (gateway), R07 (gateway)",
+                                 "at least 2 distinct rule ids among the symptoms",
+                                 "candidate_services contains gateway",
+                                 "primary_service is null",
+                                 "resolved within 180 s after the recovered event",
+                                 "not reopened and no symptom still active"])
+        inc["candidate_services"] = ["gateway"]
+        self.assertTrue(all(ok for _, ok, _ in dc.incident_checks(inc, F18, REFERENCE, T0, RECOVERED)))
+
+    def test_r03_joining_is_allowed(self):
+        inc = surge_incident()
+        inc["candidate_services"] = ["gateway"]
+        ok, detail = self.checks(inc)["at least 2 distinct rule ids among the symptoms"]
+        self.assertTrue(ok)
+        self.assertIn("3 distinct: R03 R07 R08", detail)
+
+    def test_one_rule_id_is_not_enough(self):
+        inc = incident(symptoms=[symptom("R08", "gateway")], primary=None, resolved=RECOVERED + timedelta(seconds=100))
+        inc["candidate_services"] = ["gateway"]
+        ok, detail = self.checks(inc)["at least 2 distinct rule ids among the symptoms"]
+        self.assertFalse(ok)
+        self.assertIn("1 distinct: R08", detail)
+        self.assertFalse(self.checks(inc)["the symptoms include R08 (gateway), R07 (gateway)"][0])
+
+    def test_two_symptoms_of_one_rule_are_one_rule_id(self):
+        inc = incident(symptoms=[symptom("R07", "gateway"), symptom("R07", "inventory")], primary=None)
+        self.assertFalse(self.checks(inc)["at least 2 distinct rule ids among the symptoms"][0])
+
+    def test_the_gateway_must_be_a_candidate(self):
+        inc = surge_incident()
+        inc["candidate_services"] = ["orders", "inventory"]
+        ok, detail = self.checks(inc)["candidate_services contains gateway"]
+        self.assertFalse(ok)
+        self.assertIn("['orders', 'inventory']", detail)
+
+    def test_a_primary_service_on_a_capacity_incident_fails(self):
+        inc = surge_incident(primary="gateway")
+        inc["candidate_services"] = ["gateway"]
+        ok, detail = self.checks(inc)["primary_service is null"]
+        self.assertFalse(ok)
+        self.assertIn("'gateway'", detail)
+
+    def test_the_limit_is_110_s_from_the_end_of_the_inject(self):
+        inc = surge_incident(opened_offset=110.0)
+        self.assertTrue(self.checks(inc)["opened within 110 s of the end of the inject"][0])
+        inc = surge_incident(opened_offset=110.5)
+        ok, detail = self.checks(inc)["opened within 110 s of the end of the inject"]
+        self.assertFalse(ok)
+        self.assertIn("limit 110 s", detail)
+
+    def test_the_other_new_rows_pass_and_fail_as_the_table_says(self):
+        f01 = dc.EXPECTATIONS["F01"]
+        good = incident(symptoms=[symptom("R03", "orders")], primary="orders", opened=REFERENCE + timedelta(seconds=60))
+        self.assertTrue(all(ok for _, ok, _ in dc.incident_checks(good, f01, REFERENCE, T0, RECOVERED)))
+        wrong_service = incident(symptoms=[symptom("R03", "gateway")], primary="orders", opened=REFERENCE + timedelta(seconds=60))
+        self.assertFalse(all(ok for _, ok, _ in dc.incident_checks(wrong_service, f01, REFERENCE, T0, RECOVERED)))
+        f02 = dc.EXPECTATIONS["F02"]
+        slow = incident(symptoms=[symptom("R04", "payments")], primary="payments", opened=REFERENCE + timedelta(seconds=141))
+        names = {n: ok for n, ok, _ in dc.incident_checks(slow, f02, REFERENCE, T0, RECOVERED)}
+        self.assertFalse(names["opened within 140 s of the end of the inject"])
+        f08 = dc.EXPECTATIONS["F08"]
+        inc = incident(symptoms=[symptom("R06", "orders"), symptom("R05", "gateway")], primary=None, opened=REFERENCE + timedelta(seconds=15))
+        self.assertTrue(all(ok for _, ok, _ in dc.incident_checks(inc, f08, REFERENCE, T0, RECOVERED)))
+        f11 = dc.EXPECTATIONS["F11"]
+        inc = incident(symptoms=[symptom("R07", "inventory"), symptom("R05", "gateway")], primary=None, opened=REFERENCE + timedelta(seconds=30))
+        self.assertTrue(all(ok for _, ok, _ in dc.incident_checks(inc, f11, REFERENCE, T0, RECOVERED)))
+        inc = incident(symptoms=[symptom("R07", "gateway"), symptom("R05", "gateway")], primary=None, opened=REFERENCE + timedelta(seconds=30))
+        self.assertFalse(all(ok for _, ok, _ in dc.incident_checks(inc, f11, REFERENCE, T0, RECOVERED)))   # R07 must name inventory
+
+
+class OpeningRuleTests(unittest.TestCase):
+    def test_the_rule_whose_hold_was_met_first_opened_the_incident(self):
+        inc = surge_incident()                                    # R07 first seen +3 s (hold 15), R08 +50 s, R03 +52 s
+        opening = dc.opening_symptoms(inc, FOR_S)
+        self.assertEqual([(s["rule_id"], s["service"]) for s in opening], [("R07", "gateway")])
+
+    def test_a_shorter_hold_can_win_although_it_was_seen_later(self):
+        inc = surge_incident(r07=3.0, r03=10.0)                   # R07 qualifies at +18 s, R03 (hold 10 s) at +20 s -> R07
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, FOR_S)], ["R07"])
+        inc = surge_incident(r07=8.0, r03=3.0)                    # R07 at +23 s, R03 at +13 s -> R03
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, FOR_S)], ["R03"])
+
+    def test_symptoms_that_qualify_in_the_same_second_are_all_opening(self):
+        inc = incident(symptoms=[symptom("R02", "postgres", first=REFERENCE + timedelta(seconds=1.0)),
+                                 symptom("R05", "gateway", first=REFERENCE + timedelta(seconds=1.4))])
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, FOR_S)], ["R02"])      # 11.0 s against 16.4 s
+        inc = incident(symptoms=[symptom("R02", "postgres", first=REFERENCE + timedelta(seconds=6.0)),
+                                 symptom("R05", "gateway", first=REFERENCE + timedelta(seconds=1.4))])      # 16.0 and 16.4
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, FOR_S)], ["R05", "R02"])
+
+    def test_evidence_never_opens(self):
+        evidence = symptom("R09", "gateway", first=REFERENCE)
+        evidence["opens_incident"] = False
+        inc = incident(symptoms=[evidence, symptom("R02", "postgres", first=REFERENCE + timedelta(seconds=30))])
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, FOR_S)], ["R02"])
+        self.assertEqual(dc.opening_symptoms(incident(symptoms=[evidence]), FOR_S), [])
+
+    def test_a_missing_for_s_counts_zero(self):
+        inc = surge_incident()
+        self.assertEqual([s["rule_id"] for s in dc.opening_symptoms(inc, {})], ["R07"])
+
+    def test_the_symptom_order_is_by_first_seen_relative_to_the_end_of_the_inject(self):
+        order = dc.symptom_order(surge_incident(), REFERENCE)
+        self.assertEqual([(r, s) for r, s, _ in order], [("R07", "gateway"), ("R08", "gateway"), ("R03", "gateway")])
+        self.assertEqual([round(o, 1) for _, _, o in order], [3.0, 50.0, 52.0])
+        self.assertEqual(dc.describe_order(order), "R07 gateway +3.0 s, R08 gateway +50.0 s, R03 gateway +52.0 s")
+
+    def test_describe_order_cuts_long_lists(self):
+        order = [(f"R0{i}", "x", float(i)) for i in range(1, 10)]
+        text = dc.describe_order(order, limit=3)
+        self.assertEqual(text, "R01 x +1.0 s, R02 x +2.0 s, R03 x +3.0 s (+6 more)")
+
+    def test_a_symptom_seen_before_the_inject_returned_has_a_negative_offset(self):
+        inc = incident(symptoms=[symptom("R01", "inventory", first=REFERENCE - timedelta(seconds=4.5))])
+        self.assertEqual(dc.describe_order(dc.symptom_order(inc, REFERENCE)), "R01 inventory -4.5 s")
+
+    def test_measurements_carry_the_opening_rule_and_the_order(self):
+        m = dc.measurements(surge_incident(), REFERENCE, T0, RECOVERED, FOR_S)
+        self.assertEqual(m["opening"], ["R07 gateway"])
+        self.assertEqual([r for r, _, _ in m["order"]], ["R07", "R08", "R03"])
+        self.assertEqual(m["first_symptom_s"], 3.0)
+        self.assertEqual(m["rules"], ["R03", "R07", "R08"])
+        self.assertEqual(dc.measurements(surge_incident(), REFERENCE, T0, RECOVERED)["opening"], ["R07 gateway"])   # for_s not given
+
+    def test_the_final_table_shows_the_first_symptom_and_the_opening_rule(self):
+        m = dc.measurements(surge_incident(), REFERENCE, T0, RECOVERED, FOR_S)
+        row = {"fault": "F18", "limit_s": 110, "ok": True, **m}
+        lines = dc.final_table([row])
+        self.assertIn("first symptom (s)", lines[0])
+        self.assertIn("opened by", lines[0])
+        self.assertRegex(lines[2], r"F18 +INC-0002 +20\.0 +110 +3\.0 +R07 gateway +R03 R07 R08 +null +\d+\.\d +PASS")
+
+
+class PersistenceHelperTests(unittest.TestCase):
+    def before(self):
+        return incident("INC-0004", status="open", resolved=None,
+                        symptoms=[symptom("R02", "redis", active=True), symptom("R06", "inventory", active=True)], primary="redis")
+
+    def snapshot(self):
+        return dc.incident_snapshot([incident("INC-0001"), incident("INC-0002"), incident("INC-0003")])
+
+    def after(self, **changes):
+        inc = self.before()
+        inc.update(changes)
+        return inc
+
+    def results(self, incidents):
+        return {name: (ok, detail) for name, ok, detail in dc.persistence_checks(self.before(), incidents, self.snapshot())}
+
+    def old_incidents(self):
+        return [incident("INC-0001"), incident("INC-0002"), incident("INC-0003")]
+
+    def test_the_same_incident_still_open_passes_every_check(self):
+        checks = dc.persistence_checks(self.before(), self.old_incidents() + [self.after()], self.snapshot())
+        self.assertEqual([c[0] for c in checks], ["the same incident INC-0004 is still open", "its opened_at did not change",
+                                                  "none of its symptoms was lost", "it was not reopened", "no second incident appeared"])
+        self.assertTrue(all(ok for _, ok, _ in checks), checks)
+
+    def test_the_incident_is_gone_or_resolved(self):
+        gone = self.results(self.old_incidents())
+        self.assertFalse(gone["the same incident INC-0004 is still open"][0])
+        self.assertIn("gone", gone["the same incident INC-0004 is still open"][1])
+        resolved = self.results(self.old_incidents() + [self.after(status="resolved")])
+        ok, detail = resolved["the same incident INC-0004 is still open"]
+        self.assertFalse(ok)
+        self.assertIn("'resolved'", detail)
+
+    def test_a_second_incident_is_detected(self):
+        second = incident("INC-0005", status="open", resolved=None)
+        r = self.results(self.old_incidents() + [self.after(), second])
+        ok, detail = r["no second incident appeared"]
+        self.assertFalse(ok)
+        self.assertIn("INC-0005", detail)
+
+    def test_the_old_incident_replaced_by_a_new_one(self):
+        r = self.results(self.old_incidents() + [incident("INC-0005", status="open", resolved=None)])
+        self.assertFalse(r["the same incident INC-0004 is still open"][0])
+        self.assertFalse(r["no second incident appeared"][0])
+
+    def test_a_reopened_older_incident_counts_as_a_second_incident(self):
+        old = self.old_incidents()
+        old[2] = incident("INC-0003", status="open", resolved=None, reopen=1)
+        self.assertFalse(self.results(old + [self.after()])["no second incident appeared"][0])
+
+    def test_a_lost_symptom_and_a_changed_opened_at_and_a_reopen(self):
+        lost = self.after(symptoms=[symptom("R02", "redis", active=True)])
+        r = self.results(self.old_incidents() + [lost])
+        ok, detail = r["none of its symptoms was lost"]
+        self.assertFalse(ok)
+        self.assertIn("R06 (inventory)", detail)
+        changed = self.after(opened_at=iso(T0 + timedelta(seconds=999)))
+        self.assertFalse(self.results(self.old_incidents() + [changed])["its opened_at did not change"][0])
+        reopened = self.after(reopen_count=1)
+        self.assertFalse(self.results(self.old_incidents() + [reopened])["it was not reopened"][0])
+
+    def test_more_symptoms_after_the_restart_are_fine(self):
+        more = self.after(symptoms=self.before()["symptoms"] + [symptom("R07", "gateway", active=True)])
+        self.assertTrue(all(ok for _, ok, _ in dc.persistence_checks(self.before(), self.old_incidents() + [more], self.snapshot())))
+
+    def test_active_problems(self):
+        inc = self.before()
+        self.assertEqual(dc.active_problems(inc, [("R02", "redis")]), [])
+        inc["symptoms"][0]["active"] = False
+        self.assertEqual(dc.active_problems(inc, [("R02", "redis"), ("R06", None)]), [("R02", "redis")])
+        self.assertEqual(dc.active_problems(inc, [("R05", None)]), [("R05", None)])
+
+    def test_restart_allowed(self):
+        self.assertEqual(dc.restart_allowed((0, "running"), (0, "running"), 1)[0], True)       # docker restart does not change it
+        self.assertEqual(dc.restart_allowed((0, "running"), (1, "running"), 1)[0], True)       # allowed: one planned restart
+        self.assertEqual(dc.restart_allowed((0, "running"), (2, "running"), 1)[0], False)      # one more than planned
+        self.assertEqual(dc.restart_allowed((0, "running"), (1, "running"), 0)[0], False)      # no restart was planned
+        self.assertEqual(dc.restart_allowed((3, "running"), (2, "running"), 1)[0], False)      # a count cannot go down
+        self.assertEqual(dc.restart_allowed((0, "running"), (0, "restarting"), 1)[0], False)
+        ok, detail = dc.restart_allowed((0, "running"), (1, "running"), 1)
+        self.assertEqual(detail, "RestartCount 0 -> 1 (1 planned restart(s)), state running")
+        self.assertEqual(dc.restart_allowed(None, (0, "running"), 0), (True, "not readable"))
+
+
+class EstimateTests(unittest.TestCase):
+    FULL = list(dc.FAULT_ORDER)
+
+    def test_the_full_run_from_the_measured_numbers(self):
+        """Typical: 60 s preflight + 90 + 180 + 300 s baseline + 10 s finish = 640 s; the eight holds (limit + 40 s) are 1020 s;
+        each fault adds 20 s inject and recovery + 120 s resolve (measured 115.4 to 119.7 s) + the 130 s wait of the reopen
+        window = 270 s, eight times = 2160 s; the no-data step is 2 x (10 + 60 + 25 + 34 + 90) = 438 s; persistence is 80 + 40 + 120 = 240 s."""
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, False, False), 640 + 1020 + 2160 + 438 + 240)
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, False, False), 4498)
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, False, False, at_most=True), 5188)
+
+    def test_without_the_last_steps(self):
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, True, True), 640 + 1020 + 8 * 140 + 7 * 130)       # no wait after the last fault
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, True, False) - dc.estimate_run_s(self.FULL, False, True, True), 130 + 240)
+        self.assertEqual(dc.estimate_run_s(self.FULL, False, False, True) - dc.estimate_run_s(self.FULL, False, True, True), 438)
+
+    def test_single_quick_faults(self):
+        for fid in ("F01", "F18"):
+            self.assertEqual(dc.estimate_run_s([fid], True, True, True), 60 + 30 + 180 + 10 + dc.hold_for(110, True) + 140)
+        self.assertEqual(dc.estimate_run_s(["F10"], True, True, True), 60 + 30 + 180 + 10 + dc.hold_for(50, True) + 140)
+
+    def test_at_most_is_never_below_typical_and_quick_is_shorter(self):
+        for plan in (self.FULL, ["F10"], ["F18"]):
+            for skip_nodata in (False, True):
+                for skip_persistence in (False, True):
+                    typical = dc.estimate_run_s(plan, False, skip_nodata, skip_persistence)
+                    self.assertGreater(dc.estimate_run_s(plan, False, skip_nodata, skip_persistence, at_most=True), typical)
+                    self.assertLess(dc.estimate_run_s(plan, True, skip_nodata, skip_persistence), typical)
+
+    def test_more_faults_take_longer(self):
+        self.assertGreater(dc.estimate_run_s(["F10", "F13"], False, True, True), dc.estimate_run_s(["F10"], False, True, True))
+        self.assertGreater(dc.estimate_run_s(["F02"], False, True, True), dc.estimate_run_s(["F08"], False, True, True))   # longer limit, longer hold
+
+    def test_the_measured_constants(self):
+        self.assertEqual((dc.RESOLVE_TYPICAL_S, dc.WARMUP_OK_S, dc.FAULT_OVERHEAD_S, dc.PERSIST_OBSERVE_S), (120, 34, 20, 40))
+        self.assertLessEqual(dc.RESOLVE_TYPICAL_S, dc.RESOLVE_LIMIT_S)
 
 
 if __name__ == "__main__":

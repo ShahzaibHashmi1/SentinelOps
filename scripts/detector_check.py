@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """SentinelOps M4 detector check. Standard library only, so it runs on the Windows host without installing anything.
 
-    python scripts/detector_check.py                  preflight, baseline, F10, F13, F06, no-data step
-    python scripts/detector_check.py --only F10 F13   only these faults (the baseline and the no-data step still run)
+    python scripts/detector_check.py                  preflight, baseline, F10, F13, F06, F01, F02, F08, F11, F18, no-data step, persistence step
+    python scripts/detector_check.py --only F10 F13   only these faults (the baseline, the no-data step and the persistence step still run)
     python scripts/detector_check.py --quick          shorter waits (see the banner); the full run without --quick is the one that counts
     python scripts/detector_check.py --skip-nodata    leave out the Prometheus / Loki no-data step
+    python scripts/detector_check.py --skip-persistence   leave out the detector-restart step
+    One fault alone, quick:  python scripts/detector_check.py --quick --only F01 --skip-nodata --skip-persistence
 
 Needs the full stack with the detector:
     docker compose --profile observability --profile detector up -d --build --wait
@@ -17,18 +19,22 @@ What it does, one [OK] / [FAIL] line per step (a [WARN] line is not a failure):
   baseline    the stack is healthy for 90 s, then N minutes idle and N minutes with 10 load-test users (3 and 5 by default, the
               real durations are printed). It FAILS on any rule that fires, any rule that reports no_data, any new incident.
               The highest value per rule and subject is read from Prometheus (max_over_time of detector_rule_value)
-  faults      F10, F13, F06 through `python chaos/chaos.py run <ID>` (never through docker). Per fault: exactly one new incident,
+  faults      F10, F13, F06, F01, F02, F08, F11, F18 through `python chaos/chaos.py run <ID>` (never through docker). Per fault: exactly one new incident,
               it opened within the limit, the expected rules are among its symptoms, primary_service is as expected, it
               resolved within 180 s after the `recovered` event, it was not reopened, the detector /health stayed 200 and its
               RestartCount did not change. The measured delay is printed
   no data     Prometheus (then Loki) is stopped for 60 s and started again: the detector reports no_data within 30 s, no
               incident is created or resolved, the status goes through warming_up to ok, 90 s later there is still no new incident
-  finish      the background load is removed, `chaos.py status` says no active faults, the detector did not restart, no incident is open
+  persistence F13 is injected (`chaos.py inject F13`), and when its incident is open the detector container is restarted
+              (`docker compose --profile detector restart detector`): the SAME incident is still open, none of its symptoms is lost, no
+              second incident appears, also after the warm-up while the fault still runs; then F13 is cleared and the incident resolves
+  finish      the background load is removed, `chaos.py status` says no active faults, the detector restarted only as planned
+              (the persistence step restarts it once), no incident is open
 
 How the times are read (also written in docs/DETECTOR.md):
   * A delay counts from the END of the inject: the moment `chaos.py run` printed "injected <ID> on <target> (run id ...)".
-    The `inject` event `ts` of chaos/data/ground_truth.jsonl is taken before the first docker action, about 2 s earlier;
-    that delay is printed as well. The limits are the ones of docs/CHAOS.md (counted from the end of the inject).
+    The `inject` event `ts` of chaos/data/ground_truth.jsonl is taken before the first docker action, 1 to 10 s earlier
+    (measured: about 1.4 s for F10, about 9.5 s for F06); that delay is printed as well. The limits are the ones of docs/CHAOS.md (counted from the end of the inject).
   * opened_at, resolved_at and the event ts are UTC. The clock of the detector container is compared with this host through
     the HTTP Date header of the detector (resolution 1 s); a difference above 3 s is a [WARN].
   * Only incidents that did not exist before a run are judged for that run (older ones are ignored); events are ordered by
@@ -86,8 +92,20 @@ EXPECTATIONS = {
     "F10": {"target": "postgres", "rules": [("R02", "postgres"), ("R05", None)], "primary": "postgres", "limit_s": 50},
     "F13": {"target": "redis", "rules": [("R02", "redis"), ("R06", None)], "primary": "redis", "limit_s": 50},
     "F06": {"target": "inventory", "rules": [("R01", "inventory")], "primary": "inventory", "limit_s": 50},
+    "F01": {"target": "orders", "rules": [("R03", "orders")], "primary": "orders", "limit_s": 110},
+    "F02": {"target": "payments", "rules": [("R04", "payments")], "primary": "payments", "limit_s": 140},
+    # F08 and F11: several services show symptoms and no single one is the root, so tier 1 gives primary_service null (D61).
+    "F08": {"target": "orders", "rules": [("R06", None), ("R05", None)], "primary": None, "limit_s": 80},
+    "F11": {"target": "postgres", "rules": [("R07", "inventory"), ("R05", None)], "primary": None, "limit_s": 110},
+    # F18 is the shape test of D61: one incident, several symptoms, no root service, the gateway among the candidates. R03 on the
+    # gateway may join (its CPU reaches 90 to 98 % of the limit); extra rule ids are allowed.
+    "F18": {"target": "gateway", "rules": [("R08", "gateway"), ("R07", "gateway")], "primary": None, "limit_s": 110,
+            "min_rules": 2, "candidates": ["gateway"]},
 }
-FAULT_ORDER = ["F10", "F13", "F06"]
+FAULT_ORDER = ["F10", "F13", "F06", "F01", "F02", "F08", "F11", "F18"]
+# Faults whose primary_service is null although the M3 catalogue names a root service (D61: no claim of a root cause).
+PRIMARY_NULL_BY_DESIGN = ("F08", "F11", "F18")
+PERSISTENCE_FAULT = "F13"
 
 HEALTHY_S, QUICK_HEALTHY_S = 90, 30
 IDLE_MIN, LOAD_MIN = 3, 5
@@ -112,6 +130,21 @@ DOCKER_TIMEOUT_S = 60
 COMPOSE_UP_TIMEOUT_S = 240
 LOAD_START_TIMEOUT_S = 300
 CLOCK_WARN_S = 3.0
+PERSIST_OBSERVE_S, QUICK_PERSIST_OBSERVE_S = 40, 20   # after the restart and the warm-up the fault still runs: watch the incident this long
+READY_AFTER_RESTART_ATTEMPTS, READY_AFTER_RESTART_DELAY_S = 30, 2
+REOPEN_DEFAULT_S = 120
+
+# Durations that only feed the banner estimate. Measured by the owner (CP3 run, 80/80): resolved 115.4, 116.4 and 119.7 s after the
+# recovered event; the inject returned 1.4 to 9.5 s after its ts; sources ok 30 to 34 s after a restart; no_data seen after 8 s;
+# baseline 181 s and 301 s. Recovery after the clear is 1.3 to 10.8 s (docs/CHAOS.md section 4). Not measured: the preflight time.
+PREFLIGHT_S = 60
+RESOLVE_TYPICAL_S = 120
+FAULT_OVERHEAD_S = 20                       # inject (up to about 10 s) + recovery after the clear (up to about 11 s)
+WARMUP_OK_S = 34
+NODATA_DETECT_S_TYPICAL = 10
+RESTART_SERVICE_S = 25                      # docker compose stop/up of Prometheus or Loki and its readiness
+PERSIST_STEPS_S = 80                        # inject, incident, detector restart, ready, warm-up, clear (without the observation and the resolve)
+FINISH_S = 10
 
 TS_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 INJECTED_RE = re.compile(r"injected (F\d\d) on (\S+) \(run id (F\d\d-[0-9a-f]{8})\)")
@@ -120,6 +153,7 @@ RECOVERED_RE = re.compile(r"recovered ([0-9.]+) s after the clear")
 results = []          # (name, ok, detail) of every [OK] / [FAIL] step
 warnings = []
 summary_rows = []     # one row per fault for the final table
+persist_rows = []     # the persistence step
 baseline_rows = []    # (phase, seconds)
 
 
@@ -317,6 +351,16 @@ def incident_checks(incident, expectation, reference, inject_ts, recovered_ts, r
                    ("missing " + ", ".join(describe_pair(r, s) for r, s in absent) + "; symptoms: " + present)
                    if absent else f"{len(incident['symptoms'])} symptoms: {present}"))
 
+    if expectation.get("min_rules"):
+        distinct = sorted({s["rule_id"] for s in incident["symptoms"]})
+        checks.append((f"at least {expectation['min_rules']} distinct rule ids among the symptoms",
+                       len(distinct) >= expectation["min_rules"], f"{len(distinct)} distinct: {' '.join(distinct)}"))
+    if expectation.get("candidates"):
+        wanted_c = expectation["candidates"]
+        missing_c = [c for c in wanted_c if c not in incident["candidate_services"]]
+        checks.append((f"candidate_services contains {', '.join(wanted_c)}", not missing_c,
+                       f"candidate_services {incident['candidate_services']}"))
+
     primary = incident["primary_service"]
     label = expectation["primary"] if expectation["primary"] else "null"
     checks.append((f"primary_service is {label}", primary == expectation["primary"],
@@ -338,7 +382,30 @@ def incident_checks(incident, expectation, reference, inject_ts, recovered_ts, r
     return checks
 
 
-def measurements(incident, reference, inject_ts, recovered_ts):
+def opening_symptoms(incident, for_s_by_rule):
+    """The symptoms that opened the incident: of the symptoms whose rule can open an incident, those whose hold was met
+    first (first_seen + for_s of the rule is the smallest; ties within 1 s). A rule without a known for_s counts 0 s."""
+    openers = [s for s in incident["symptoms"] if s["opens_incident"]]
+    if not openers:
+        return []
+    due = {id(s): parse_ts(s["first_seen"]) + timedelta(seconds=for_s_by_rule.get(s["rule_id"], 0.0)) for s in openers}
+    earliest = min(due.values())
+    return sorted((s for s in openers if seconds_between(due[id(s)], earliest) <= 1.0),
+                  key=lambda s: (s["first_seen"], s["rule_id"], s["service"] or ""))
+
+
+def symptom_order(incident, reference):
+    """[(rule id, service, seconds from `reference` to first_seen)] in the order the symptoms were first seen."""
+    rows = sorted(incident["symptoms"], key=lambda s: (s["first_seen"], s["rule_id"], s["service"] or ""))
+    return [(s["rule_id"], s["service"], seconds_between(parse_ts(s["first_seen"]), reference)) for s in rows]
+
+
+def describe_order(order, limit=8):
+    parts = [f"{rule} {service or '-'} {offset:+.1f} s" for rule, service, offset in order[:limit]]
+    return ", ".join(parts) + (f" (+{len(order) - limit} more)" if len(order) > limit else "")
+
+
+def measurements(incident, reference, inject_ts, recovered_ts, for_s_by_rule=None):
     """The numbers that the final table and docs/DETECTOR.md use."""
     opened = parse_ts(incident["opened_at"])
     first = min((parse_ts(s["first_seen"]) for s in incident["symptoms"]), default=opened)
@@ -350,6 +417,8 @@ def measurements(incident, reference, inject_ts, recovered_ts):
             "resolve_s": seconds_between(resolved, recovered_ts) if resolved else None,
             "symptoms": len(incident["symptoms"]),
             "rules": sorted({s["rule_id"] for s in incident["symptoms"]}),
+            "opening": [f"{s['rule_id']} {s['service'] or '-'}" for s in opening_symptoms(incident, for_s_by_rule or {})],
+            "order": symptom_order(incident, reference),
             "primary": incident["primary_service"]}
 
 
@@ -497,29 +566,81 @@ def wait_until(predicate, timeout_s, interval_s, clock=None, sleep=None):
         sleep(min(interval_s, max(0.0, timeout_s - elapsed)))
 
 
-def estimate_run_s(plan, quick, skip_nodata):
-    """Rough upper estimate of the whole check for the banner."""
-    healthy = QUICK_HEALTHY_S if quick else HEALTHY_S
-    idle, load = (QUICK_IDLE_MIN, QUICK_LOAD_MIN) if quick else (IDLE_MIN, LOAD_MIN)
-    settle = QUICK_SETTLE_S if quick else SETTLE_S
-    total = 120 + healthy + 60 * (idle + load)
-    for fid in plan:
-        total += hold_for(EXPECTATIONS[fid]["limit_s"], quick) + 60 + 75 + max(settle, 130)
-    if not skip_nodata:
-        total += 2 * (OUTAGE_S + 90 + 45 + (QUICK_AFTER_OK_S if quick else AFTER_OK_S))
-    return total
-
-
 def final_table(rows):
     """Lines of the summary table: one row per fault."""
-    headers = ["fault", "incident", "opened after (s)", "limit (s)", "rules in the incident", "primary", "resolved after (s)", "result"]
+    headers = ["fault", "incident", "opened after (s)", "limit (s)", "first symptom (s)", "opened by", "rules in the incident",
+               "primary", "resolved after (s)", "result"]
     table = []
     for r in rows:
         table.append([r["fault"], r.get("incident_id", "-"),
                       f"{r['delay_s']:.1f}" if r.get("delay_s") is not None else "-", r["limit_s"],
+                      f"{r['first_symptom_s']:.1f}" if r.get("first_symptom_s") is not None else "-",
+                      ", ".join(r.get("opening", [])) or "-",
                       " ".join(r.get("rules", [])) or "-", r.get("primary") or "null",
                       f"{r['resolve_s']:.1f}" if r.get("resolve_s") is not None else "-", "PASS" if r["ok"] else "FAIL"])
     return format_table(headers, table)
+
+
+# ---- persistence and restart helpers (pure)
+
+def restart_allowed(before, after, planned):
+    """before / after: (RestartCount, state) of the detector container. Docker does not count a manual restart in
+    RestartCount (only the restart policy does), so the count may stay or rise by at most the planned restarts; the
+    container must be running. Returns (ok, detail)."""
+    if before is None or after is None:
+        return True, "not readable"
+    delta = after[0] - before[0]
+    ok = 0 <= delta <= planned and after[1] == "running"
+    return ok, f"RestartCount {before[0]} -> {after[0]} ({planned} planned restart(s)), state {after[1]}"
+
+
+def persistence_checks(before, incidents_after, snapshot_before):
+    """[(name, ok, detail)] after the detector was restarted while the incident `before` (a dict, read just before the
+    restart) was open. snapshot_before: incident_snapshot() taken before the fault was injected."""
+    incident_id = before["incident_id"]
+    after = next((i for i in incidents_after if i["incident_id"] == incident_id), None)
+    new, reopened = incidents_for_run(incidents_after, snapshot_before)
+    others = [i["incident_id"] for i in new if i["incident_id"] != incident_id]
+    checks = [(f"the same incident {incident_id} is still open", after is not None and after["status"] == "open",
+               f"status {after['status']!r}" if after else "the incident is gone")]
+    if after is not None:
+        lost = sorted(set(symptom_pairs(before)) - set(symptom_pairs(after)), key=lambda pair: (pair[0], pair[1] or ""))
+        checks.append(("its opened_at did not change", after["opened_at"] == before["opened_at"],
+                       f"{before['opened_at']} -> {after['opened_at']}"))
+        checks.append(("none of its symptoms was lost", not lost,
+                       ("lost: " + ", ".join(describe_pair(r, s) for r, s in lost)) if lost else f"{len(after['symptoms'])} symptoms"))
+        checks.append(("it was not reopened", after["reopen_count"] == 0, f"reopen_count {after['reopen_count']}"))
+    checks.append(("no second incident appeared", not others and not reopened,
+                   (f"new: {', '.join(others)}" if others else "") + (f" reopened: {', '.join(reopened)}" if reopened else "")))
+    return checks
+
+
+def active_problems(incident, wanted):
+    """The (rule id, service or None) pairs of `wanted` that have no ACTIVE symptom in the incident."""
+    return [(rule, service) for rule, service in wanted
+            if not any(s["active"] and s["rule_id"] == rule and (service is None or s["service"] == service)
+                       for s in incident["symptoms"])]
+
+
+def estimate_run_s(plan, quick, skip_nodata, skip_persistence=False, at_most=False):
+    """Estimate of the whole check in seconds for the banner, from the numbers measured by the owner (see the constants).
+    at_most=True uses the limits instead of the typical times (resolve 180 s, Loki restart up to 90 s longer)."""
+    healthy = QUICK_HEALTHY_S if quick else HEALTHY_S
+    idle, load = (QUICK_IDLE_MIN, QUICK_LOAD_MIN) if quick else (IDLE_MIN, LOAD_MIN)
+    gap = max(QUICK_SETTLE_S if quick else SETTLE_S, REOPEN_DEFAULT_S + REOPEN_MARGIN_S)
+    resolve = RESOLVE_LIMIT_S if at_most else RESOLVE_TYPICAL_S
+    after_ok = QUICK_AFTER_OK_S if quick else AFTER_OK_S
+    total = PREFLIGHT_S + healthy + 60 * (idle + load) + FINISH_S
+    for index, fid in enumerate(plan):
+        total += hold_for(EXPECTATIONS[fid]["limit_s"], quick) + FAULT_OVERHEAD_S + resolve
+        if index < len(plan) - 1 or not skip_persistence:
+            total += gap                                         # the wait before the next fault (reopen window)
+    if not skip_nodata:
+        per_source = NODATA_DETECT_S_TYPICAL + OUTAGE_S + RESTART_SERVICE_S + WARMUP_OK_S + after_ok
+        total += 2 * per_source + (150 if at_most else 0)        # at most: Loki /ready can answer 503 for a while after the start
+    if not skip_persistence:
+        total += PERSIST_STEPS_S + (QUICK_PERSIST_OBSERVE_S if quick else PERSIST_OBSERVE_S) + resolve
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +846,15 @@ def detector_restarts():
     return int(out[0]), out[1]
 
 
+def detector_started_at():
+    """StartedAt of the detector container (it changes with every start), or None when it cannot be read."""
+    ids = compose_service(DETECTOR_SERVICE, "ps", "-q", DETECTOR_SERVICE).stdout.split()
+    if not ids:
+        return None
+    out = run(["docker", "inspect", "--format", "{{.State.StartedAt}}", ids[0]], DOCKER_TIMEOUT_S).stdout.strip()
+    return out or None
+
+
 # -- the background load (same approach as scripts/chaos_check.py) --------------------------------
 
 def load_filters():
@@ -770,21 +900,27 @@ def start_load(duration_s):
 # ---------------------------------------------------------------------------
 
 class Check:
-    def __init__(self, catalogue, plan, quick, skip_nodata):
+    def __init__(self, catalogue, plan, quick, skip_nodata, skip_persistence=False):
         self.catalogue = catalogue
         self.plan = plan
         self.quick = quick
         self.skip_nodata = skip_nodata
+        self.skip_persistence = skip_persistence
+        self.persist_observe_s = QUICK_PERSIST_OBSERVE_S if quick else PERSIST_OBSERVE_S
         self.settle_s = QUICK_SETTLE_S if quick else SETTLE_S
         self.healthy_s = QUICK_HEALTHY_S if quick else HEALTHY_S
         self.idle_s = 60 * (QUICK_IDLE_MIN if quick else IDLE_MIN)
         self.load_s = 60 * (QUICK_LOAD_MIN if quick else LOAD_MIN)
         self.after_ok_s = QUICK_AFTER_OK_S if quick else AFTER_OK_S
-        self.load_duration_s = int(1.3 * estimate_run_s(plan, quick, skip_nodata)) + 300
+        self.load_duration_s = int(1.15 * estimate_run_s(plan, quick, skip_nodata, skip_persistence, at_most=True)) + 300
         self.load_started = False
         self.stopped = set()                 # prometheus / loki while they are stopped by this script
         self.children = []                   # chaos.py run processes (ended on Ctrl+C)
         self.restarts_at_start = None
+        self.started_at = None               # StartedAt of the detector container (updated after the planned restart)
+        self.planned_restarts = 0
+        self.detector_touched = False        # the persistence step restarts the detector: the cleanup makes sure it runs
+        self.for_s = {}
         self.rules = []
         self.known = {}                      # incident snapshot at the end of the last step
         self.quiet_since = None              # `recovered` ts of the last fault (UTC)
@@ -820,6 +956,7 @@ class Check:
         if not record("the 6 M1 containers and the detector are healthy", not problems, ", ".join(problems)):
             raise Abort("a container is not healthy (repair with: python chaos/chaos.py clear --all)")
         self.restarts_at_start = detector_restarts()
+        self.started_at = detector_started_at()
         if self.restarts_at_start is None:
             warn("the RestartCount of the detector cannot be read: that check is skipped")
 
@@ -835,6 +972,7 @@ class Check:
         status = self.wait_sources_ok()
         self.reopen_within_s = int(status["settings"].get("reopen_within_s", 120))
         self.rules = api("/internal/v1/rules")["rules"]
+        self.for_s = {r["id"]: r["for_s"] for r in self.rules}
         self.wait_no_open_incident()
         result = chaos("status")
         if not record('chaos.py status says "no active faults"', result.returncode == 0
@@ -1077,11 +1215,13 @@ class Check:
         checks = incident_checks(incident, exp, reference, inject_ts, recovered_ts)
         for name, ok, detail in checks:
             record(f"{fid} {name}", ok, detail)
-        m = measurements(incident, reference, inject_ts, recovered_ts)
+        m = measurements(incident, reference, inject_ts, recovered_ts, self.for_s)
         say(f"    measured: {m['incident_id']} opened {m['delay_s']:.1f} s after the end of the inject "
             f"({m['delay_from_inject_ts_s']:.1f} s after the inject ts), first symptom {m['first_symptom_s']:.1f} s after it, "
             + (f"resolved {m['resolve_s']:.1f} s after the recovered event, " if m["resolve_s"] is not None else "not resolved, ")
             + f"{m['symptoms']} symptoms ({' '.join(m['rules'])}), title: {incident['title']}")
+        say(f"    opened by {', '.join(m['opening']) or '?'} (first symptom {m['first_symptom_s']:+.1f} s from the end of the inject); "
+            f"symptoms in the order first seen: {describe_order(m['order'])}")
         row.update(m)
         row["ok"] = all(ok for _, ok, _ in checks) and len(new) == 1 and not reopened and not health["bad"]
         if incident.get("resolved_at"):
@@ -1202,6 +1342,125 @@ class Check:
                ", ".join(sources_not_ok(get_status())))
         self.known = incident_snapshot(get_incidents())
 
+    # -- persistence (F13) -------------------------------------------------------------------
+    def persistence(self):
+        """Inject F13, wait for its incident, restart the detector, and show that the SAME incident is still open, that no
+        second incident appeared and that nothing was lost; then clear F13 and wait for the incident to resolve."""
+        fid = PERSISTENCE_FAULT
+        exp = EXPECTATIONS[fid]
+        target = self.catalogue[fid]["default_target"]
+        section(f"Persistence: the detector is restarted while a {fid} incident is open")
+        row = {"fault": fid, "ok": False}
+        persist_rows.append(row)
+        self.ensure_background_load()
+        self.wait_before_fault()
+        before = incident_snapshot(get_incidents())
+        gap = snapshot_changes(self.known, before)
+        record("persistence: no incident appeared or changed since the last step", not gap, "; ".join(gap))
+        started_before = detector_started_at()
+        offset = GROUND_TRUTH_PATH.stat().st_size if GROUND_TRUTH_PATH.exists() else 0
+        say(f"python chaos/chaos.py inject {fid}")
+        result = chaos("inject", fid)
+        reference = utcnow()                                   # chaos.py returned: the end of the inject
+        hit = next((parse_injected_line(line) for line in result.stdout.splitlines() if parse_injected_line(line)), None)
+        if not record(f"persistence: chaos.py inject {fid}", result.returncode == 0 and hit is not None,
+                      f"exit code {result.returncode}" + ("" if hit else "; no 'injected ...' line")):
+            show_output(result.text)
+            chaos("clear", "--all")
+            return
+        say(f"    inject returned (run id {hit[2]})")
+        body_ok = False
+        try:
+            body_ok = self.persistence_restart(exp, before, started_before)
+        finally:
+            cleared = chaos("clear", fid)                      # always, also after a failed check or Ctrl+C
+        if not record(f"persistence: chaos.py clear {fid}", cleared.returncode == 0, f"exit code {cleared.returncode}"):
+            show_output(cleared.text)
+            chaos("clear", "--all")
+            return
+        raw = GROUND_TRUTH_PATH.read_bytes()[offset:] if GROUND_TRUTH_PATH.exists() else b""
+        events, bad = parse_event_lines(raw)
+        mine = run_events(events, hit[2])
+        problems = run_problems(mine, fid, target) if not bad else [f"bad ground-truth line(s): {bad}"]
+        if not record("persistence: ground truth: inject, clear, recovered in file order, no late flag", not problems, "; ".join(problems)):
+            return
+        inject_ts, recovered_ts = parse_ts(mine[0]["ts"]), parse_ts(mine[2]["ts"])
+        self.quiet_since = recovered_ts
+        self.wait_for_incident(before, recovered_ts)
+        incidents = get_incidents()
+        new, reopened = incidents_for_run(incidents, before)
+        self.known = incident_snapshot(incidents)
+        ok_one = record("persistence: exactly one new incident for the run, none reopened", len(new) == 1 and not reopened,
+                        f"{len(new)} new ({', '.join(i['incident_id'] for i in new) or 'none'})"
+                        + (f"; reopened: {', '.join(reopened)}" if reopened else ""))
+        if not new:
+            return
+        incident = new[0]
+        checks = incident_checks(incident, exp, reference, inject_ts, recovered_ts)
+        for name, ok, detail in checks:
+            record(f"persistence: {name}", ok, detail)
+        if incident.get("resolved_at"):
+            self.last_resolved = parse_ts(incident["resolved_at"])
+        m = measurements(incident, reference, inject_ts, recovered_ts, self.for_s)
+        row.update(incident_id=incident["incident_id"], ok=body_ok and ok_one and all(ok for _, ok, _ in checks))
+        say(f"    {m['incident_id']} opened {m['delay_s']:.1f} s after the end of the inject, resolved "
+            + (f"{m['resolve_s']:.1f} s after the recovered event" if m["resolve_s"] is not None else "never") + f", {m['symptoms']} symptoms")
+
+    def persistence_restart(self, exp, before, started_before):
+        """The part of the persistence step between the inject and the clear. Returns True when every check passed."""
+        def opened():
+            try:
+                new, _ = incidents_for_run(get_incidents(), before)
+            except ApiError:
+                return None
+            return new[0] if new and not missing_rules(new[0], exp["rules"]) else None
+        incident, seconds = wait_until(opened, exp["limit_s"] + 15, POLL_S)
+        if not record("persistence: the incident is open with the expected rules before the restart", bool(incident),
+                      f"{seconds:.0f} s after the end of the inject"):
+            return False
+        say(f"    {incident['incident_id']} is open with {len(incident['symptoms'])} symptoms: restarting the detector ...")
+        passed = True
+        self.detector_touched = True
+        result = compose_service(DETECTOR_SERVICE, "restart", DETECTOR_SERVICE, timeout=COMPOSE_UP_TIMEOUT_S)
+        self.planned_restarts += 1
+        passed &= bool(record("persistence: docker compose --profile detector restart detector", result.returncode == 0,
+                              f"exit code {result.returncode}"))
+        if result.returncode != 0:
+            show_output(result.text)
+        ready, detail = wait_ready(f"{DETECTOR}/ready", READY_AFTER_RESTART_ATTEMPTS, READY_AFTER_RESTART_DELAY_S)
+        passed &= bool(record("persistence: detector /ready answers 200 after the restart", ready, detail))
+        started_after = detector_started_at()
+        if started_before is not None and started_after is not None:
+            passed &= bool(record("persistence: the detector container was really restarted (StartedAt changed)",
+                                  started_after != started_before, f"{started_before} -> {started_after}"))
+            self.started_at = started_after
+        if not ready:
+            return False
+
+        for name, ok, detail in persistence_checks(incident, get_incidents(), before):
+            passed &= bool(record(f"persistence: right after the restart {name}", ok, detail))
+
+        def sources_ok():
+            try:
+                return not sources_not_ok(get_status())
+            except ApiError:
+                return False
+        warmup = int(get_status()["settings"].get("warmup_s", 30))
+        ok, seconds = wait_until(sources_ok, warmup + 90, 2)
+        passed &= bool(record("persistence: both data sources are ok again after the warm-up", bool(ok), f"{seconds:.0f} s"))
+        say(f"    watching the incident for {self.persist_observe_s} s (the fault is still running) ...")
+        end = time.monotonic() + self.persist_observe_s
+        while time.monotonic() < end:
+            time.sleep(POLL_S)
+        latest = get_incidents()
+        for name, ok, detail in persistence_checks(incident, latest, before):
+            passed &= bool(record(f"persistence: after the warm-up {name}", ok, detail))
+        current = next((i for i in latest if i["incident_id"] == incident["incident_id"]), None)
+        inactive = active_problems(current, exp["rules"][:1]) if current else exp["rules"][:1]
+        passed &= bool(record("persistence: the symptom of the running fault is still active after the restart",
+                              not inactive, ", ".join(describe_pair(r, s) for r, s in inactive)))
+        return passed
+
     # -- finish ------------------------------------------------------------------------------
     def finish(self):
         section("Finish")
@@ -1212,8 +1471,13 @@ class Check:
         record('chaos.py status says "no active faults"', result.stdout.strip() == "no active faults", f"exit code {result.returncode}")
         after = detector_restarts()
         if self.restarts_at_start is not None and after is not None:
-            record("the detector never restarted during the check", after == self.restarts_at_start,
-                   f"RestartCount {self.restarts_at_start[0]} -> {after[0]}, state {after[1]}")
+            ok, detail = restart_allowed(self.restarts_at_start, after, self.planned_restarts)
+            record("the detector restarted only as planned", ok, detail)
+        if self.started_at is not None:
+            now_started = detector_started_at()
+            if now_started is not None:
+                record("the detector was not started again after the last planned start (StartedAt)", now_started == self.started_at,
+                       f"{self.started_at} -> {now_started}")
         status = get_status()
         record("no incident is open at the end", not status.get("open_incident_id"), str(status.get("open_incident_id") or ""))
         record("both data sources are ok at the end", not sources_not_ok(status), ", ".join(sources_not_ok(status)))
@@ -1238,6 +1502,9 @@ def emergency_cleanup(check):
         for service in sorted(check.stopped):
             up, detail = check.restart_service(service)
             say(f"  {service} started again: {'ok' if up else 'FAILED (' + detail + ')'}")
+        if check.detector_touched:
+            result = compose_service(DETECTOR_SERVICE, "up", "-d", DETECTOR_SERVICE, timeout=COMPOSE_UP_TIMEOUT_S)
+            say(f"  detector started again (docker compose --profile detector up -d detector): exit code {result.returncode}")
     finally:
         signal.signal(signal.SIGINT, old)
 
@@ -1251,8 +1518,15 @@ def print_final():
             say("  " + line)
 
 
+def print_persistence():
+    for row in persist_rows:
+        say(f"\nPersistence ({row['fault']}): the detector was restarted while {row.get('incident_id', 'the incident')} was open: "
+            + ("PASS" if row["ok"] else "FAIL"))
+
+
 def summary(complete=True):
     print_final()
+    print_persistence()
     failed = [name for name, ok, _ in results if not ok]
     say(f"\n{len(results) - len(failed)}/{len(results)} checks passed" + (f"   ({len(warnings)} warning(s))" if warnings else ""))
     if failed:
@@ -1272,6 +1546,7 @@ def main(argv=None):
     parser.add_argument("--only", nargs="+", metavar="ID", help="check only these faults, for example F10 F13")
     parser.add_argument("--quick", action="store_true", help="shorter waits (baseline 1 + 2 min, healthy 30 s, hold limit + 25 s)")
     parser.add_argument("--skip-nodata", action="store_true", help="leave out the Prometheus / Loki no-data step")
+    parser.add_argument("--skip-persistence", action="store_true", help="leave out the step that restarts the detector during an incident")
     args = parser.parse_args(argv)
 
     plan = list(FAULT_ORDER)
@@ -1284,7 +1559,7 @@ def main(argv=None):
         plan = [fid for fid in FAULT_ORDER if fid in wanted]
     try:
         catalogue = {fault["id"]: fault for fault in json.loads(CATALOGUE_PATH.read_text(encoding="utf-8"))}
-        for fid in plan:
+        for fid in plan + ([] if args.skip_persistence else [PERSISTENCE_FAULT]):
             if catalogue[fid]["default_target"] != EXPECTATIONS[fid]["target"]:
                 print(f"{fid}: the default target in the catalogue is {catalogue[fid]['default_target']}, this script expects "
                       f"{EXPECTATIONS[fid]['target']}", file=sys.stderr)
@@ -1293,12 +1568,14 @@ def main(argv=None):
         print(f"cannot read {CATALOGUE_PATH}: {exc}", file=sys.stderr)
         return 1
 
-    check = Check(catalogue, plan, args.quick, args.skip_nodata)
-    minutes = int(math.ceil(estimate_run_s(plan, args.quick, args.skip_nodata) / 60))
-    say(f"SentinelOps M4 detector check: {', '.join(plan)}{'' if args.skip_nodata else ' + no-data step'} | "
+    check = Check(catalogue, plan, args.quick, args.skip_nodata, args.skip_persistence)
+    typical = int(math.ceil(estimate_run_s(plan, args.quick, args.skip_nodata, args.skip_persistence) / 60))
+    most = int(math.ceil(estimate_run_s(plan, args.quick, args.skip_nodata, args.skip_persistence, at_most=True) / 60))
+    steps = ("" if args.skip_nodata else " + no-data step") + ("" if args.skip_persistence else " + persistence step")
+    say(f"SentinelOps M4 detector check: {', '.join(plan)}{steps} | "
         f"{'quick' if args.quick else 'normal'} mode | baseline {check.idle_s // 60} min idle + {check.load_s // 60} min with {LOAD_USERS} users | "
-        f"at most about {minutes} minutes")
-    say("delays are counted from the END of the inject (the moment chaos.py printed 'injected ...'); the inject ts of the ground truth is about 2 s earlier")
+        f"about {typical} minutes (typical, from the measured times), at most about {most}")
+    say("delays are counted from the END of the inject (the moment chaos.py printed 'injected ...'); the inject ts of the ground truth is 1 to 10 s earlier")
     try:
         check.preflight()
         check.baseline()
@@ -1307,6 +1584,8 @@ def main(argv=None):
         if not args.skip_nodata:
             for source in ("prometheus", "loki"):
                 check.nodata(source)
+        if not args.skip_persistence:
+            check.persistence()
         check.finish()
         return summary()
     except Abort as exc:
