@@ -120,10 +120,10 @@
       "guard": null,
       "min_traffic": null,
       "provenance": {
-        "baseline_max": 33.4,
+        "baseline_max": 33.55,
         "fault_value_min": 83.54,
-        "margin_ratio": 2.395,
-        "derived_from": "F02 (payments): 83.54 % of the memory limit 35 s after the inject, steady about 86 to 87 (owner's run). Baselines: payments 23.9 (docs/CHAOS.md) and 29.06 (owner's full chaos_check run); highest value of the owner's M4 CP1 measurement (Prometheus max_over_time over 16 minutes at 15 s steps: 10 idle minutes, then 6 minutes with 10 users): payments 33.4 (inventory 27.9, orders 28.0, gateway 23.5, postgres 11.2, redis 6.7). baseline_max 33.4; 1.5 x 33.4 = 50.1."
+        "margin_ratio": 2.385,
+        "derived_from": "F02 (payments): 83.54 % of the memory limit 35 s after the inject, steady about 86 to 87 (owner's run). Baselines (highest values): payments 23.9 (docs/CHAOS.md) and 29.06 (owner's full chaos_check run); 33.4 in the owner's M4 CP1 measurement (Prometheus max_over_time over 16 minutes at 15 s steps: 10 idle minutes, then 6 minutes with 10 users); 33.55 in the owner's full detector_check.py run (10 users, detector_rule_value through Prometheus; the other services there: gateway 24.8, inventory 29.9, orders 26.7, postgres 7.5, redis 9.9). baseline_max 33.55; 1.5 x 33.55 = 50.3."
       },
       "description": "Memory working set of a container above 80 % of its memory limit. The query is the Overview query 'memory % of limit' per container."
     },
@@ -215,10 +215,10 @@
         "subject_label": "service"
       },
       "provenance": {
-        "baseline_max": 0.203,
+        "baseline_max": 0.2107,
         "fault_value_min": 0.955,
-        "margin_ratio": 2.463,
-        "derived_from": "p95 per app service, 1-minute window, health, ready and metrics routes excluded. First readings (owner's runs): F18 gateway 0.955 s after 0 s, F11 inventory 1.507 s after 15 s. Baselines: gateway p95 0.1 to 0.2 s (docs/CHAOS.md) and about 203 ms on the dashboard at 20 users (docs/OBSERVABILITY.md section 8); inventory 0.01 s. baseline_max 0.203. Rate guard: evaluated only at 1 request/s or more per service."
+        "margin_ratio": 2.373,
+        "derived_from": "p95 per app service, 1-minute window, health, ready and metrics routes excluded. First readings (owner's runs): F18 gateway 0.955 s after 0 s, F11 inventory 1.507 s after 15 s. Baselines: gateway p95 0.1 to 0.2 s (docs/CHAOS.md) and about 203 ms on the dashboard at 20 users (docs/OBSERVABILITY.md section 8); inventory 0.01 s. Highest values of the owner's full detector_check.py run (10 users, detector_rule_value through Prometheus): gateway 0.2107, orders 0.1952, payments 0.157, inventory 0.0366. baseline_max 0.2107; 1.5 x 0.2107 = 0.316. Rate guard: evaluated only at 1 request/s or more per service."
       },
       "description": "p95 request latency of an app service above 0.5 s for 15 s, only while that service receives at least 1 request per second."
     },

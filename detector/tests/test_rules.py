@@ -240,8 +240,10 @@ class ShippedRulesTests(unittest.TestCase):
     def test_margin_rule_numbers_of_the_prompt(self):
         r = self.by_id
         self.assertEqual((r["R03"].provenance.baseline_max, r["R03"].provenance.fault_value_min), (44, 90.92))
-        self.assertEqual((r["R04"].provenance.baseline_max, r["R04"].provenance.fault_value_min), (33.4, 83.54))
-        self.assertEqual(r["R04"].provenance.margin_ratio, 2.395)
+        self.assertEqual((r["R04"].provenance.baseline_max, r["R04"].provenance.fault_value_min), (33.55, 83.54))
+        self.assertEqual(r["R04"].provenance.margin_ratio, 2.385)
+        self.assertEqual((r["R07"].provenance.baseline_max, r["R07"].provenance.fault_value_min), (0.2107, 0.955))
+        self.assertEqual(r["R07"].provenance.margin_ratio, 2.373)
         self.assertEqual((r["R09"].provenance.baseline_max, r["R09"].provenance.fault_value_min), (0, 1))
         self.assertEqual(r["R09"].threshold, 0)
         self.assertIsNone(r["R09"].provenance.margin_ratio)
@@ -255,6 +257,23 @@ class ShippedRulesTests(unittest.TestCase):
             if rule.comparator == ">" and p.baseline_max is not None:
                 self.assertGreaterEqual(rule.threshold + 1e-9, 1.5 * p.baseline_max, rule.id)
                 self.assertLessEqual(rule.threshold, p.fault_value_min + 1e-9, rule.id)
+
+    def test_derived_from_names_the_baseline_that_the_rule_uses(self):
+        """The text and the number must not drift apart: 'baseline_max <number>' appears in derived_from."""
+        for rule in self.rules:
+            baseline = rule.provenance.baseline_max
+            if rule.comparator == ">" and baseline:                      # R03, R04, R07, R08 (R05, R06, R09 have baseline 0)
+                self.assertIn(f"baseline_max {baseline:g}", rule.provenance.derived_from, rule.id)
+        checked = [r.id for r in self.rules if r.comparator == ">" and r.provenance.baseline_max]
+        self.assertEqual(checked, ["R03", "R04", "R07", "R08"])
+
+    def test_the_highest_measured_baselines_of_the_owners_runs_are_below_one_and_a_half_times_the_threshold(self):
+        """Highest values of the full detector_check.py run (10 users): memory of payments 33.55 %, p95 of the gateway 0.2107 s."""
+        r = self.by_id
+        self.assertLessEqual(1.5 * 33.55, r["R04"].threshold)
+        self.assertLessEqual(1.5 * 0.2107, r["R07"].threshold)
+        self.assertEqual(r["R04"].provenance.baseline_max, 33.55)
+        self.assertEqual(r["R07"].provenance.baseline_max, 0.2107)
 
     def test_no_rule_has_pending_provenance(self):
         """R09 was PENDING in CP1; its Loki baseline is measured now (0 lines), so nothing is pending."""
