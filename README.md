@@ -234,3 +234,25 @@ python scripts/chaos_check.py             # verifies all 8 faults (18 min 40 s m
 `python chaos/chaos.py run F11 --warmup 60 --hold 120 --cooldown 60` does warm-up, inject, hold, clear and cool-down as one labelled experiment. The ground truth is in `chaos/data/ground_truth.jsonl` (git-ignored; delete `chaos/data` before real evaluation runs). Do not run `scripts/smoke_test.py` while a load test or F18 is running.
 
 Catalogue, expected symptoms with their queries, ground-truth format, safety rules, the F18 measurement and known limitations are in [`docs/CHAOS.md`](docs/CHAOS.md).
+
+## Detection (module M4)
+
+The incident detector turns Prometheus metrics and Loki logs into incidents: nine threshold rules (`detector/rules/rules.json`, each with its provenance) and a deterministic correlator that keeps one open incident at a time. Tier 1 records symptoms and an optional `primary_service`; it does not claim a root cause. The detector is one container (compose profile `detector`, port `127.0.0.1:9100`, incidents in SQLite in the named volume `detector-data`) that reads only Prometheus and Loki.
+
+### Quick start (PowerShell, repo root)
+
+```powershell
+docker compose --profile observability --profile detector up -d --build --wait
+Invoke-RestMethod http://127.0.0.1:9100/internal/v1/status
+(Invoke-RestMethod "http://127.0.0.1:9100/internal/v1/incidents?status=open").incidents
+python -m unittest discover -s detector/tests
+python scripts/detector_check.py
+```
+
+- With the detector running, `docker compose ps -q` lists 12 containers (6 M1 + 5 observability + detector). "11" means without the detector profile. Starting only the detector (`docker compose --profile detector up -d --build --wait detector`) is valid; both sources then report `no_data`.
+- API (GET only): `http://127.0.0.1:9100/health`, `/ready`, `/metrics`, `/internal/v1/status`, `/internal/v1/rules`, `/internal/v1/incidents`, `/internal/v1/incidents/<incident_id>`.
+- `python scripts/detector_check.py` needs the observability and detector profiles (12 containers) and takes about 75 minutes, at most about 87 minutes (estimated, not yet timed in one go). Options: `--only F10 F13` selects faults, `--quick` shortens the waits, `--skip-nodata` leaves out the Prometheus and Loki no-data step, `--skip-persistence` leaves out the persistence step. One fault alone: `python scripts/detector_check.py --quick --only F01 --skip-nodata --skip-persistence`. Exit code 0 means pass.
+- After a change of detector code or `rules.json`, rebuild with the first command above.
+- Stop: `docker compose --profile observability --profile detector down` (add `-v` to delete all data volumes, including the incident history).
+
+Architecture, rules with provenance, the incident format with two real examples, correlation, no-data semantics, measured detection times, limitations and troubleshooting are in [`docs/DETECTOR.md`](docs/DETECTOR.md).
