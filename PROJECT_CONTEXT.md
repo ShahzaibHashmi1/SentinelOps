@@ -1,8 +1,8 @@
 # SentinelOps: Project Context (read this first)
 
 **Owner:** Shahzaib, BS-IT, Minhaj University Lahore (FYP)
-**Last updated:** 2026-10-31
-**Current module:** M4 (Detection and correlation, tier 1) is done and verified on the owner's machine (CP1 to CP5; full run of `scripts/detector_check.py`: 164/164 checks, 68 minutes). M1 (Target application), M2 (Observability stack), M3 (Chaos / fault injection) and M4 are done and verified. Next module: M5 (evidence builder and dependency graph; its prompt is written by the reviewer)
+**Last updated:** 2026-11-02
+**Current module:** M4 (Detection and correlation, tier 1) is done and verified on the owner's machine (CP1 to CP5; full run of `scripts/detector_check.py`: 164/164 checks, 68 minutes). M1 (Target application), M2 (Observability stack), M3 (Chaos / fault injection) and M4 are done and verified. Tooling step R1 (cumulative regression runner `scripts/regression.py`, ledger `docs/REGRESSION.md`, rule 10, D66) is done and verified: first green runs of gate A (9 suites, 158 s) and gate B (13 suites, 898 s) on the owner's machine on 2026-11-02; gate C is open until the completion of M5. Next module: M5 (evidence builder and dependency graph; its prompt is written by the reviewer), the first module that must pass the gates of rule 10
 **Full proposal:** `docs/PROPOSAL.md` · **UI target:** `docs/ui-mockup/dashboard.png`
 
 ## 1. What this project is
@@ -20,6 +20,12 @@ SentinelOps is an AI-powered platform that monitors a containerised application,
 7. Do not rewrite or refactor files unrelated to the current task.
 8. Use current, non-deprecated APIs (FastAPI lifespan, Pydantic v2, Docker Compose v2 syntax without `version:`).
 9. Work in checkpoints: after each one, list files created, exact verification commands and expected output, then wait.
+10. **Cumulative regression rule (M5 and every later module).** A checkpoint or module is not done until the older modules still pass.
+    a. Gate A (every checkpoint): all unit suites of all modules pass with 0 failures (M1 service tests, chaos/tests, detector/tests, regression/tests and the new module's tests), plus the rule validation and the allowed-imports scan.
+    b. Gate B (every checkpoint that changes a file outside the new module's own folder, and at module completion): refill the stock, then smoke_test.py 22/22, observability_check.py 29/29, chaos_check.py --only F10 --quick 36/36 and detector_check.py --quick --only F10 --skip-nodata --skip-persistence, against the live stack with the new module running. The expected numbers are in docs/REGRESSION.md.
+    c. Gate C (module completion only, on the final commit): chaos_check.py full, detector_check.py full and the new module's own full check, raw output given to the reviewer.
+    d. An older test that fails is fixed in the NEW code. An older test or script may be changed only through a recorded decision (D-number) that says why the contract changed; it may be extended, never loosened. A new container gets its own compose profile, and the container-count expectations of older scripts are extended in the same decision.
+    e. The reviewer does not mark a checkpoint verified without the gate output pasted raw, and records date, commit and counts in docs/REGRESSION.md.
 
 ## 2a. Host environment
 
@@ -53,6 +59,8 @@ Host facts: Docker 29.8.1 with Docker Compose v5.5.1 (use the Compose file forma
 | Stop everything including observability and the detector | `docker compose --profile observability --profile detector down` (add `-v` to delete all data volumes, including `detector-data` with the incident history) |
 | Refill the stock of all 50 products (the load tests consume it; at 0 the smoke test and the observability check fail with HTTP 409 `insufficient_stock`) | `"UPDATE items SET stock = 1000;" \| docker compose exec -T postgres sh -c 'psql -U $POSTGRES_USER -d $POSTGRES_DB'` (prints `UPDATE 50`; wait 35 s because the inventory service caches stock reads for 30 s) |
 | Detector status and incidents (needs the detector profile) | `Invoke-RestMethod http://127.0.0.1:9100/internal/v1/status`, `(Invoke-RestMethod "http://127.0.0.1:9100/internal/v1/incidents?status=open").incidents`, `Invoke-RestMethod http://127.0.0.1:9100/internal/v1/incidents/INC-0003 \| ConvertTo-Json -Depth 6` (contract: `docs/DETECTOR.md`) |
+| Cumulative regression gates (rule 10) | `python scripts/regression.py --gate A` (unit suites, rules validation, allowed-imports scan; no stack, Docker only for the M1 service tests; 158 s measured), `--gate B` (A + live checks; rebuilds and starts the 12-container stack, refills the stock; 898 s measured), `--gate C` (A + B + the full runs; module completion only, at least about 101 minutes; not run yet); options `--list`, `--dry-run`, `--only <suite-id> ...` (verdict says partial), `--no-build`, `--report PATH`; exit code 0 = pass, 1 = fail, 2 = usage, 130 = interrupted; report `regression_report.md` (git-ignored); expected counts and ledger: `docs/REGRESSION.md` |
+| Regression runner unit tests | `python -m unittest discover -s regression/tests` (standard library only, no docker needed; 180 tests, including the test that pins `docs/REGRESSION.md` to the `SUITES` list of the runner) |
 
 Later modules must keep these working and must not require changes to the M1 service code.
 
@@ -124,12 +132,13 @@ sentinelops/
   services/          gateway, orders, payments, inventory (app/, Dockerfile, requirements.txt, tests/)
   db/init.sql        schema and seed data
   loadtest/          locustfile.py, results/
-  scripts/           smoke_test.py, observability_check.py, chaos_check.py, detector_check.py
+  scripts/           smoke_test.py, observability_check.py, chaos_check.py, detector_check.py, regression.py (cumulative regression runner, rule 10)
   chaos/             chaos.py (CLI), faults.py (fault code), catalogue.json, tests/ (test_chaos_unit.py, test_chaos_check.py); data/ and overrides/ are git-ignored
   detector/          Dockerfile; app/ (model.py, rules.py, sources.py, thresholds.py, correlator.py, store.py, loop.py, api.py, metrics.py, logging_setup.py, main.py), rules/rules.json, tests/ (unit tests, fakes, fake HTTP servers, test_docs_detector.py)
+  regression/        tests/ (_bootstrap.py, test_regression.py); the runner's report regression_report.md is git-ignored
   observability/     prometheus/ (prometheus.yml), loki/ (loki-config.yml), alloy/ (config.alloy),
                      grafana/provisioning/ (datasources, dashboard provider), grafana/dashboards/ (sentinelops-overview.json, sentinelops-service-detail.json)
-  docs/              PROPOSAL.md, topology.yaml, BASELINE.md, OBSERVABILITY.md, CHAOS.md, DETECTOR.md, ui-mockup/
+  docs/              PROPOSAL.md, topology.yaml, BASELINE.md, OBSERVABILITY.md, CHAOS.md, DETECTOR.md, REGRESSION.md, ui-mockup/
   prompts/           one prompt file per module
   docker-compose.yml, docker-compose.override.yml, .env.example, .gitignore, .gitattributes
   README.md, PROJECT_CONTEXT.md
@@ -157,6 +166,8 @@ Later modules add: `agent/`, `kb/`, `remediation/`, `api/`, `dashboard/`, `notif
 | M14 | Replay and offline benchmark | 2 | Not started | |
 
 Status values: Not started · In progress · Done (verified) · Blocked
+
+**Tooling (not a module):** R1 cumulative regression runner, done and verified on the owner's machine (2026-11-02, gates A and B green; gate C not run yet): `scripts/regression.py` (gates A, B, C), `docs/REGRESSION.md` (rule 10, suite table with the expected counts, last green runs in section 11), `regression/tests/` (180 tests). Decision D66.
 
 ## 7a. Notes about the UI mockup
 
@@ -231,12 +242,13 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 | D63 | 2026-10-24 | `scripts/detector_check.py` runs the faults only through `chaos.py run`, counts delays from the end of the inject (the moment `chaos.py` printed `injected ...`; the inject ts of the ground truth is earlier, by 1.3 to 2 s for F10 and F13 and by about 9.5 s for F06, and the script prints both), and waits at least 100 s after the recovered event and at least `reopen_within_s` + 10 s after the previous incident resolved before the next fault | A gap shorter than `reopen_within_s` (120 s) makes the next opening symptom reopen the old incident instead of creating a new one; docs/CHAOS.md limits count from the end of the inject |
 | D64 | 2026-10-31 | The M4 thresholds are PromQL and LogQL expressions in `detector/rules/rules.json`, evaluated by the detector, not Prometheus rule files or Alertmanager (the proposal's tool list says "Prometheus rules") | Explainable (provenance and description per rule), testable without Docker (fake sources, fake clock), no new component and no `rule_files` or `alerting` section, one rule format for Prometheus and Loki, and the incident format needs the correlator anyway |
 | D65 | 2026-10-31 | `docs/DETECTOR.md` is the contract of M4 for M5, M6, M10 and M12, and `detector/tests/test_docs_detector.py` keeps it in step with the code: every rule id, API route and metric name must appear, the rules and provenance tables must equal `rules.json`, the two JSON examples must have exactly the fields of the incident format. Measured values in the doc are only values printed by the owner's runs | A doc that can drift from `rules.json` or `api.py` would mislead the later modules |
+| D66 | 2026-11-02 | Cumulative regression rule (rule 10 in section 2) and runner: `scripts/regression.py` runs gates A, B, C (cumulative); expected counts live in `docs/REGRESSION.md` and are pinned to `SUITES` by a test. The prerequisite "no chaos fault is active" is decided by the text `no active faults` of `chaos.py status`, because that command exits 0 also with active or stale faults. The M1 service tests pass by exit code and their count is informational (`count_policy` info) | Every new module must be proven compatible with all older modules, mechanically, with raw output for the reviewer |
 
 ## 9. Current focus
 
-- **Module:** M4 Detection and correlation is done and verified (CP1 to CP5, full run 164/164); next module M5 (evidence builder and dependency graph)
-- **Last completed:** M4 CP5 step 2 (`docs/DETECTOR.md`, README section "Detection (module M4)", `detector/tests/test_docs_detector.py`; `1c7a87c`) and the full run of `scripts/detector_check.py` (2026-10-31, 164/164 checks, 68 minutes), recorded together with this file; before it CP5 step 1 (434a9a5), CP4 (26aadc9), CP3 (37daf74), CP2 (012f7a4), CP2 step 1 (6f8b7e7), CP1 (ea52768) and the M4 prompt (459bb6a)
-- **Next task:** the reviewer writes reviewer handoff version 6 and then `prompts/M5_*.md` (evidence builder and dependency graph, per the module table of `docs/PROPOSAL.md`; M5 reads the detector API `/internal/v1/incidents`, Prometheus and Loki, see `docs/DETECTOR.md` section 6). Before any smoke test or long run refill the stock (section 2b). Delete `chaos/data` before the first real evaluation run
+- **Module:** M4 Detection and correlation is done and verified (CP1 to CP5, full run 164/164); tooling step R1 (cumulative regression runner, rule 10, D66) is done and verified (gates A and B green on 2026-11-02, gate C open); next module M5 (evidence builder and dependency graph)
+- **Last completed:** tooling step R1 (`scripts/regression.py`, `docs/REGRESSION.md`, `regression/tests/` with 180 tests, rule 10, D66; the commit after `449f66c`) with the first green runs of gate A (9/9 suites, 158 s) and gate B (13/13 suites, 898 s); before it the M4 final update (`449f66c`), CP5 step 2 (`1c7a87c`) and the full run of `scripts/detector_check.py` (2026-10-31, 164/164 checks, 68 minutes)
+- **Next task:** the reviewer writes `prompts/M5_*.md` (evidence builder and dependency graph, per the module table of `docs/PROPOSAL.md`; M5 reads the detector API `/internal/v1/incidents`, Prometheus and Loki, see `docs/DETECTOR.md` section 6) with the gates of rule 10 in its Definition of Done (gate A at every checkpoint, gate B at every checkpoint that changes a file outside the module's own folder and at completion, gate C at completion), then reviewer handoff version 7 at the end of M5. Before any smoke test or long run refill the stock (section 2b). Delete `chaos/data` before the first real evaluation run
 
 ## 10. Known issues
 
@@ -338,6 +350,11 @@ The numbers shown in the mockup (MTTR, accuracy, etc.) are placeholders for desi
 - M4 CP5 step 2: `docs/DETECTOR.md` shows every measured detection and resolve time with the number of runs; one or two runs give no spread, M12 measures the real distribution. `test_docs_detector.py` pins the rules table and the provenance table of the document to `rules.json` by value: a deliberate change of a threshold, hold, severity, role or provenance number needs the same edit in the document, otherwise the test fails (intended). Expected unit-test count on the owner's machine: 445.
 - M4 CP5 step 2: a later detector (EWMA / z-score) needs one list element in `App.__init__` of `detector/app/main.py` and its `RuleMeta` entries for the `Correlator`; `GET /internal/v1/rules` and the per-rule part of `/internal/v1/status` list only the rules handed to the API context until that list is extended. `model.py`, `correlator.py`, `store.py`, `api.py` and the incident format do not change (`docs/DETECTOR.md` section 12).
 - M4: faults injected less than 120 s after the previous incident resolved are merged into one incident (reopen window, D61); the check script therefore waits 130 s. A consumer such as M12 must keep the same spacing between faults.
+- R1 measured on the owner's machine (2026-11-02, files of step R1 not committed yet, base commit `449f66c`): gate A 9/9 suites, 158 s (M1 service tests 28.1, 29.5, 32.1 and 30.9 s; M3 unit 3.6 s; M4 unit 27.6 s; R1 unit 5.3 s); gate B 13/13 suites, 23/23 checks, 898 s = 14 min 58 s (the early estimate of 20 to 30 minutes was too high): smoke 22/22 in 15.8 s, observability 29/29 in 19.0 s, chaos F10 quick 36/36 in 114.1 s, detector F10 quick 41/41 in 425.6 s (INC-0025 opened 13.3 s after the end of the inject, resolved 120.2 s after the recovered event), the wait for "no open incident" before the detector check was 100 s. M1 service test counts: gateway 11, orders 10, payments 10, inventory 11. The unit, smoke and observability durations are now measured but the `typical_s` values of `SUITES` were left unchanged. Gate C has not been run
+- R1: `chaos.py status` exits 0 also when faults are active or stale (it prints a table), so the exit code proves nothing; the runner checks the text `no active faults` (found in the review of step R1; the builder's fake host had modelled exit code 1)
+- R1: the stock is refilled once per runner run (prerequisite). After gate B the sum of the stock was 48509 (50000 after the refill, so gate B consumed 1491 pieces; a gate C with the full chaos and detector runs was not measured). A suite that meets an empty stock fails with `insufficient_stock`, the runner prints a hint and the report keeps the last 60 lines (refill and run `--gate <X> --only <suite-id> --no-build`)
+- R1: the suite timeouts are builder choices; the estimate counts only the measured durations of `SUITES` (4 min, 10 min, 18 min 40 s, 68 min); on Ctrl+C the runner ends its direct child and runs `chaos.py clear --all` and `docker rm -f` of both load containers (a grandchild process started by a check script can live a few seconds longer); `docker rm -f` exits 0 for a container that does not exist, so the cleanup prints `removed <name>` also then
+- R1: `M4-imports` is a plain text scan (comments included), like `Select-String`; the M1 service tests are pass-by-exit-code and their count is informational (a difference is a `[WARN]`); the Windows `.gitignore` of the owner has mixed line endings (CRLF and LF), which Git normalises
 
 ## 11. Session handoff prompt (paste at the start of a new chat)
 

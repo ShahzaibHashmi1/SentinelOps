@@ -22,3 +22,5 @@ Thumbs.db
 chaos/data/
 chaos/overrides/
 __pycache__/
+
+/regression_report.md
