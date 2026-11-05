@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "no_single_root_margin": 10,
+  "components": {
+    "anomaly_strength": {
+      "cap": 15,
+      "params": {
+        "floor": 0.25,
+        "full_ratio": 2.0
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "Shows how far the worst signal is above its threshold. A signal just over the line earns floor x cap, a signal at full_ratio x its threshold or more (and every down signal) earns the full cap. Low cap: strength alone does not separate a cause from its effects.",
+        "evidence": null
+      }
+    },
+    "precedence": {
+      "cap": 10,
+      "params": {
+        "window_s": 30,
+        "tie_s": 5
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "Causes show symptoms before their effects. The earliest anomalous service earns the full cap, services within tie_s of it too (the step is 5 s), later ones lose points linearly over window_s.",
+        "evidence": null
+      }
+    },
+    "hard_container_evidence": {
+      "cap": 30,
+      "params": {
+        "crash_loop_restarts": 2,
+        "single_restart_fraction": 0.5
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "A container that is missing, exited, OOM-killed, whose scrape target is down, or that restarts repeatedly is direct proof of the failure, so this is the largest cap. A single restart earns single_restart_fraction of the cap (it can be a repair).",
+        "evidence": null
+      }
+    },
+    "recent_change": {
+      "cap": 15,
+      "params": {
+        "lookback_s": 120,
+        "observe_slack_s": 15,
+        "kinds": [
+          "recreated",
+          "config_changed"
+        ]
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "A recreate or configuration change shortly before the first anomaly of the same service is the classic cause of configuration faults (F06, F08). observe_slack_s covers the delay of the change poller, which records a change when it sees it.",
+        "evidence": null
+      }
+    },
+    "origin_position": {
+      "cap": 10,
+      "params": {},
+      "provenance": {
+        "kind": "design",
+        "reason": "An anomalous service whose dependencies are all healthy cannot be a victim of one of them, so it is a candidate origin.",
+        "evidence": null
+      }
+    },
+    "shared_dependency": {
+      "cap": 10,
+      "params": {
+        "min_dependents": 2
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "When two or more anomalous services call the same dependency directly and either the dependency is anomalous itself or the callers report dependency errors or latency against it, the dependency is a plausible common cause. The extra condition keeps a healthy service from earning the bonus only because its callers are anomalous for another reason.",
+        "evidence": null
+      }
+    },
+    "effect_demotion": {
+      "cap": 20,
+      "params": {},
+      "provenance": {
+        "kind": "design",
+        "reason": "An anomalous service with an anomalous dependency is explained by that dependency; this penalty moves the symptom service below its cause. It is a penalty, not a bonus.",
+        "evidence": null
+      }
+    },
+    "log_evidence": {
+      "cap": 10,
+      "params": {
+        "own_errors_fraction": 0.3,
+        "dependency_error_fraction": 0.7,
+        "dependency_latency_fraction": 0.4,
+        "dependents_for_full": 1
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "Errors in the service's own logs above its baseline, and dependency errors or dependency latency that another service reports against it, name it as a suspect. One reporting service is enough for the full share (dependents_for_full 1) because the caller measured the failing or slow call itself, and a fault such as a lock on one table is visible from one caller only. Dependency errors weigh more than own errors because the victim names the cause.",
+        "evidence": null
+      }
+    },
+    "detector_hint": {
+      "cap": 8,
+      "params": {
+        "candidate_points": 4
+      },
+      "provenance": {
+        "kind": "design",
+        "reason": "The detector already saw the symptoms; its primary_service gets a small bonus and its candidate_services a smaller one. Small on purpose: M5 must add information, not repeat the detector.",
+        "evidence": null
+      }
+    }
+  }
+}

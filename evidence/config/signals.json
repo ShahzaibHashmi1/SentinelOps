@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "sources": [
+    "detector",
+    "prometheus",
+    "loki",
+    "docker",
+    "topology"
+  ],
+  "window": {
+    "pre_s": 120,
+    "post_resolved_s": 60,
+    "baseline_s": 300,
+    "step_s": 5,
+    "baseline_margin": 1.5,
+    "change_lookback_s": 120,
+    "query_timeout_s": 3
+  },
+  "signals": [
+    {
+      "name": "cpu_pct_of_limit",
+      "unit": "%",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app",
+        "infra"
+      ],
+      "query": "100 * sum(rate(container_cpu_usage_seconds_total{service=\"@service@\"}[1m])) / (max(container_spec_cpu_quota{service=\"@service@\"}) / max(container_spec_cpu_period{service=\"@service@\"}))",
+      "by": null,
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 85,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 44,
+            "fault_value_min": 90.92,
+            "source": "docs/DETECTOR.md section 4.2 rule R03 (baseline max 44 at 20 users, F01 first reading above 85: 90.92)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "memory_pct_of_limit",
+      "unit": "%",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app",
+        "infra"
+      ],
+      "query": "100 * max(container_memory_working_set_bytes{service=\"@service@\"}) / max(container_spec_memory_limit_bytes{service=\"@service@\"})",
+      "by": null,
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 80,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 33.55,
+            "fault_value_min": 83.54,
+            "source": "docs/DETECTOR.md section 4.2 rule R04 (baseline max 33.55, F02 value 83.54)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "container_present",
+      "unit": "count",
+      "kind": "down",
+      "comparator": "==",
+      "tiers": [
+        "app",
+        "infra"
+      ],
+      "query": "count(container_memory_working_set_bytes{service=\"@service@\"}) or vector(0)",
+      "by": null,
+      "guard": {
+        "query": "count(container_memory_working_set_bytes{service=~\"gateway|orders|payments|inventory|postgres|redis\"})",
+        "min": 1,
+        "on_fail": "no_data",
+        "source": "mirrors the guard of rule R02: at least one of the 6 series must exist, otherwise the signal is no_data"
+      },
+      "empty": "no_value",
+      "thresholds": [],
+      "provenance": {
+        "kind": "documented",
+        "baseline_max": null,
+        "fault_value_min": null,
+        "source": "docs/DETECTOR.md rule R02; docs/CHAOS.md section 4 F10 and F13: 0 within 10 s"
+      }
+    },
+    {
+      "name": "up",
+      "unit": "bool",
+      "kind": "down",
+      "comparator": "==",
+      "tiers": [
+        "app"
+      ],
+      "query": "min(up{job=\"@service@\"})",
+      "by": null,
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [],
+      "provenance": {
+        "kind": "documented",
+        "baseline_max": null,
+        "fault_value_min": null,
+        "source": "docs/DETECTOR.md rule R01; docs/CHAOS.md section 4 F06: min(up) is 0 from the first reading"
+      }
+    },
+    {
+      "name": "restarts",
+      "unit": "count",
+      "kind": "restarts",
+      "comparator": ">=",
+      "tiers": [
+        "app",
+        "infra"
+      ],
+      "query": "max(container_start_time_seconds{service=\"@service@\"})",
+      "by": null,
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 1,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 0,
+            "fault_value_min": null,
+            "source": "PROJECT_CONTEXT.md known facts: container_start_time_seconds changes when a container is restarted; the signal counts increases of that value in the window"
+          }
+        }
+      ]
+    },
+    {
+      "name": "request_rate",
+      "unit": "req/s",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app"
+      ],
+      "query": "sum(rate(http_requests_total{service=\"@service@\",route!~\"/(health|ready|metrics)\"}[1m]))",
+      "by": null,
+      "guard": null,
+      "empty": "zero",
+      "thresholds": [
+        {
+          "services": [
+            "gateway"
+          ],
+          "absolute_min": 30,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 18.97,
+            "fault_value_min": 31.77,
+            "source": "docs/DETECTOR.md rule R08 (baseline max 18.97 at 20 users, F18 reading 31.77); the other services have no documented number and are reported without a verdict"
+          }
+        }
+      ]
+    },
+    {
+      "name": "error_ratio_5xx",
+      "unit": "%",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app"
+      ],
+      "query": "100 * (sum(rate(http_requests_total{service=\"@service@\",status=~\"5..\",route!~\"/(health|ready|metrics)\"}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"@service@\",route!~\"/(health|ready|metrics)\"}[1m])), 0.001)",
+      "by": null,
+      "guard": {
+        "query": "sum(rate(http_requests_total{service=\"@service@\",route!~\"/(health|ready|metrics)\"}[1m]))",
+        "min": 0.5,
+        "on_fail": "quiet",
+        "source": "rate guard of rule R05: at least 0.5 requests/s, otherwise the step is quiet"
+      },
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "gateway"
+          ],
+          "absolute_min": 5,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 0,
+            "fault_value_min": 6.26,
+            "source": "docs/DETECTOR.md rule R05 (baseline 0, F08 first reading above 5: 6.26)"
+          }
+        },
+        {
+          "services": [
+            "orders",
+            "payments",
+            "inventory"
+          ],
+          "absolute_min": 5,
+          "provenance": {
+            "kind": "assumed",
+            "baseline_max": null,
+            "fault_value_min": null,
+            "source": "R05 number reused for the three services behind the gateway; to be measured in CP4 and CP5"
+          }
+        }
+      ]
+    },
+    {
+      "name": "latency_p95",
+      "unit": "s",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app"
+      ],
+      "query": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{service=\"@service@\",route!~\"/(health|ready|metrics)\"}[1m])))",
+      "by": null,
+      "guard": {
+        "query": "sum(rate(http_requests_total{service=\"@service@\",route!~\"/(health|ready|metrics)\"}[1m]))",
+        "min": 1,
+        "on_fail": "quiet",
+        "source": "rate guard of rule R07: at least 1 request/s, otherwise the step is quiet"
+      },
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 0.5,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 0.2107,
+            "fault_value_min": 0.955,
+            "source": "docs/DETECTOR.md rule R07 (highest baseline max 0.2107 s at gateway, first F18 reading above 0.5: 0.955)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dependency_error_rate",
+      "unit": "1/s",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app"
+      ],
+      "query": "sum by (dependency) (rate(dependency_requests_total{job=\"@service@\",outcome!=\"success\"}[1m]))",
+      "by": "dependency",
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 0.1,
+          "provenance": {
+            "kind": "documented",
+            "baseline_max": 0,
+            "fault_value_min": 0.18,
+            "source": "docs/DETECTOR.md rule R06 (baseline 0, F08 reading 0.18)"
+          }
+        }
+      ]
+    },
+    {
+      "name": "dependency_latency_p95",
+      "unit": "s",
+      "kind": "high_is_bad",
+      "comparator": ">",
+      "tiers": [
+        "app"
+      ],
+      "query": "histogram_quantile(0.95, sum by (le, dependency) (rate(dependency_request_duration_seconds_bucket{job=\"@service@\"}[1m])))",
+      "by": "dependency",
+      "guard": null,
+      "empty": "no_value",
+      "thresholds": [
+        {
+          "services": [
+            "*"
+          ],
+          "absolute_min": 0.5,
+          "provenance": {
+            "kind": "assumed",
+            "baseline_max": null,
+            "fault_value_min": null,
+            "source": "no documented dependency-latency numbers; the R07 number is reused; F11 lifts it to about 2 s (pool timeout); to be measured in CP4 and CP5"
+          }
+        }
+      ]
+    }
+  ],
+  "logs": {
+    "selectors": {
+      "app": "{service=\"@service@\",level=~\"WARNING|ERROR\"}",
+      "infra": "{service=\"@service@\"} |~ \"(?i)(error|fatal|panic|warning)\""
+    },
+    "count_query": "sum(count_over_time(@selector@ [@range@s]))",
+    "events_query": "topk(@top@, sum by (event) (count_over_time(@selector@ | json event=\"event\" [@range@s])))",
+    "samples_query": "@selector@",
+    "events_tiers": [
+      "app"
+    ],
+    "top_events": 5,
+    "samples": 3,
+    "fetch_lines": 30,
+    "sample_chars": 300,
+    "request_ids": 3,
+    "provenance": {
+      "kind": "documented",
+      "source": "docs/OBSERVABILITY.md section 4 (Logs row): app services have a level label, postgres and redis need a text match"
+    }
+  }
+}
