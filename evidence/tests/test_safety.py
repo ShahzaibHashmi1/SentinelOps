@@ -89,13 +89,27 @@ class ScanTests(unittest.TestCase):
             for needle in ("os.system", "eval(", "exec(", "__import__", "pickle"):
                 self.assertNotIn(needle, text, f"{os.path.basename(path)}: {needle}")
 
-    def test_no_file_reads_outside_config_and_topology(self):
-        """Modules that read files take the path as an argument; none opens a path by itself."""
+    def test_no_stray_paths_or_env_file_reads(self):
+        """The runtime socket path appears only in the runtime module; no module names the .env file."""
+        env_file = re.compile(r"(?<![A-Za-z_])\.env\b")
         for path in app_files():
+            name = os.path.basename(path)
             text = read(path)
-            self.assertNotIn("/var/run", text)
-            self.assertNotIn(".env", text.replace("environment", ""))
+            if name != RUNTIME_MODULE:
+                self.assertNotIn("/var/run", text, name)
+            self.assertIsNone(env_file.search(text), name)
 
+    def test_dynamic_import_only_in_main(self):
+        """The runtime module is loaded by name from the configuration, so only main.py may use importlib."""
+        for path in app_files():
+            name = os.path.basename(path)
+            self.assertEqual("importlib" in read(path), name == "main.py", name)
+
+    def test_runtime_module_exists_and_policy_names_only_get(self):
+        text = read(os.path.join(APP_DIR, RUNTIME_MODULE))
+        self.assertIn("def check_call", text)
+        for verb in ("POST", "PUT", "DELETE", "PATCH"):
+            self.assertNotIn(f'"{verb}"', text)
 
 if __name__ == "__main__":
     unittest.main()

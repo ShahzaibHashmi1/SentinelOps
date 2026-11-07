@@ -1,6 +1,5 @@
 import copy
 import io
-import json
 import unittest
 from contextlib import redirect_stdout
 

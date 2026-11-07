@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import _bootstrap  # noqa: F401
 import fakes
-from fakes import GRAPH, RANKING, SIGNALS, T0, TOPOLOGY, at, box, change, logs, svc
+from fakes import GRAPH, RANKING, SIGNALS, T0, TOPOLOGY, at, box, change, svc
 
 from app import bundle as bd
 from app.model import BUNDLE_KEYS, BUNDLE_MAX_BYTES, LogEvidence, fmt_ts, parse_ts, validate_bundle

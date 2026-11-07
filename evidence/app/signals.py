@@ -128,6 +128,7 @@ class LogsConfig:
 @dataclass(frozen=True)
 class SignalsConfig:
     sources: tuple
+    runtime_source: str  # the source that provides container observations; its module is <name>_source
     window: WindowConfig
     signals: tuple
     logs: LogsConfig
@@ -289,13 +290,16 @@ def _check_margin(th: Threshold, where: str) -> None:
 
 
 def parse_signals(raw, known_services: set | None = None, tiers_of: dict | None = None) -> SignalsConfig:
-    _exact(raw, {"schema_version", "sources", "window", "signals", "logs"}, "signals.json")
+    _exact(raw, {"schema_version", "sources", "runtime_source", "window", "signals", "logs"}, "signals.json")
     if raw["schema_version"] != 1:
         raise SignalsConfigError("schema_version must be 1")
     names = raw["sources"]
     if (not isinstance(names, list) or len(names) != 5 or len(set(names)) != 5
             or not all(isinstance(n, str) and _NAME.match(n) for n in names)):
         raise SignalsConfigError("sources must be a list of exactly 5 distinct lowercase names")
+    runtime = raw["runtime_source"]
+    if runtime not in names:
+        raise SignalsConfigError("runtime_source must be one of the sources")
     w = raw["window"]
     _exact(w, {"pre_s", "post_resolved_s", "baseline_s", "step_s", "baseline_margin", "change_lookback_s", "query_timeout_s"}, "window")
     window = WindowConfig(
@@ -334,7 +338,7 @@ def parse_signals(raw, known_services: set | None = None, tiers_of: dict | None 
         fetch_lines=int(_num(lg["fetch_lines"], "logs.fetch_lines", 1)), sample_chars=int(_num(lg["sample_chars"], "logs.sample_chars", 20)),
         request_ids=int(_num(lg["request_ids"], "logs.request_ids", 0)), provenance=_provenance_loose(lg["provenance"]),
     )
-    return SignalsConfig(tuple(raw["sources"]), window, tuple(signals), logs)
+    return SignalsConfig(tuple(raw["sources"]), runtime, window, tuple(signals), logs)
 
 
 def _provenance_loose(obj) -> Provenance:

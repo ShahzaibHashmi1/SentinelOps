@@ -7,6 +7,7 @@
     "docker",
     "topology"
   ],
+  "runtime_source": "docker",
   "window": {
     "pre_s": 120,
     "post_resolved_s": 60,

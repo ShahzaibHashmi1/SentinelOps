@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 import _bootstrap  # noqa: F401
 import fakes
 from _bootstrap import RANKING_PATH
-from fakes import DEPS, RANKING, at, box, change, down, hint, logs, rank_scenario, sig, stack, svc
+from fakes import DEPS, RANKING, box, change, down, hint, logs, rank_scenario, sig, stack, svc
 
 from app import ranking as rk
 from app.model import load_json_file
@@ -277,6 +277,33 @@ class RankingBehaviourTests(unittest.TestCase):
         s3 = stack(payments=[sig("latency_p95", ratio=3.0)], inventory=[sig("latency_p95", ratio=3.0), down("up")])
         r3 = rank_scenario(s3, hint())
         self.assertFalse(r3.no_single_root)
+
+    def two_origins(self):
+        return stack(payments=[sig("latency_p95", ratio=3.0)], inventory=[sig("latency_p95", ratio=3.0)])
+
+    def gap_of(self, services, h):
+        from dataclasses import replace
+        base = rank_scenario(services, h)  # the gap does not depend on the margin
+        return base.suspects[0].score - base.suspects[1].score, replace
+
+    def test_no_single_root_gap_exactly_equal_to_the_margin_is_true(self):
+        s, h = self.two_origins(), hint("inventory")
+        gap, replace = self.gap_of(s, h)
+        cfg = replace(RANKING, margin=gap)
+        from app.ranking import rank
+        anomalous = [n for n, e in s.items() if e.is_anomalous()]
+        shared = fakes.GRAPH.shared_dependencies(anomalous, 2)
+        self.assertGreater(gap, 0)
+        self.assertTrue(rank(s, DEPS, shared, h, cfg).no_single_root)
+
+    def test_no_single_root_gap_just_above_the_margin_is_false(self):
+        s, h = self.two_origins(), hint("inventory")
+        gap, replace = self.gap_of(s, h)
+        cfg = replace(RANKING, margin=gap - 0.05)
+        from app.ranking import rank
+        anomalous = [n for n, e in s.items() if e.is_anomalous()]
+        shared = fakes.GRAPH.shared_dependencies(anomalous, 2)
+        self.assertFalse(rank(s, DEPS, shared, h, cfg).no_single_root)
 
     def test_load_symptom_forces_no_single_root(self):
         s = stack(gateway=[sig("request_rate", ratio=3.0)] + [down("container_present")])

@@ -140,7 +140,8 @@ def _data_gaps(states: Mapping[str, tuple], names: Sequence[str], services: Mapp
             gaps.append({"source": name, "service": None, "signal": None, "detail": clean_text(f"{state}: {detail}")})
     for svc in sorted(services):
         for signal, detail in sorted(services[svc].gaps):
-            gaps.append({"source": "prometheus", "service": svc, "signal": signal, "detail": clean_text(str(detail))})
+            source = "loki" if signal == "logs" else "prometheus"  # "logs" is the log evidence of a service
+            gaps.append({"source": source, "service": svc, "signal": signal, "detail": clean_text(str(detail))})
     return gaps
 
 

@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .model import ChangeRecord, fmt_ts, parse_ts, validate_bundle
+from .model import fmt_ts, parse_ts, validate_bundle
 
 MAX_PER_INCIDENT = 30
 SCHEMA_VERSION = 1

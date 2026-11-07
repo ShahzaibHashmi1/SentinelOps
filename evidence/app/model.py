@@ -29,6 +29,8 @@ class ModelError(ValueError):
 
 # ---------------------------------------------------------------- time
 
+_FRACTION = re.compile(r"(\.\d+)")
+
 def parse_ts(text: str) -> datetime:
     """Parse an ISO 8601 timestamp (Z or offset). A timestamp without zone counts as UTC."""
     if not isinstance(text, str) or not text:
@@ -36,6 +38,7 @@ def parse_ts(text: str) -> datetime:
     raw = text.strip()
     if raw.endswith(("Z", "z")):
         raw = raw[:-1] + "+00:00"
+    raw = _FRACTION.sub(lambda m: m.group(1)[:7], raw, count=1)  # keep at most 6 fractional digits
     try:
         dt = datetime.fromisoformat(raw)
     except ValueError as exc:
